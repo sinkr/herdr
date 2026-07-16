@@ -51,8 +51,8 @@ pub(crate) struct KiloInstallPaths {
 
 #[derive(Debug)]
 pub(crate) struct OmpInstallPaths {
-    pub extension_path: PathBuf,
-    pub removed_legacy_pi_extension: bool,
+    pub extension_paths: Vec<PathBuf>,
+    pub removed_legacy_pi_extension_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -153,8 +153,8 @@ pub(crate) struct PiUninstallResult {
 
 #[derive(Debug)]
 pub(crate) struct OmpUninstallResult {
-    pub extension_path: PathBuf,
-    pub removed_extension: bool,
+    pub extension_paths: Vec<PathBuf>,
+    pub removed_extension_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug)]

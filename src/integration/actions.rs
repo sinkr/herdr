@@ -10,7 +10,7 @@ use super::targets::{
     uninstall_qodercli,
 };
 use super::version::{agent_version_requirement, enforce_agent_version};
-use super::{KIMI_MIN_VERSION, PI_EXTENSION_INSTALL_NAME};
+use super::KIMI_MIN_VERSION;
 
 pub(crate) fn install_target(
     target: crate::api::schema::IntegrationTarget,
@@ -42,19 +42,15 @@ fn install_target_inner(target: crate::api::schema::IntegrationTarget) -> io::Re
         crate::api::schema::IntegrationTarget::Omp => {
             let installed = install_omp()?;
             let mut messages = Vec::new();
-            if installed.removed_legacy_pi_extension {
+            for path in installed.removed_legacy_pi_extension_paths {
                 messages.push(format!(
                     "removed legacy pi integration from omp extension directory at {}",
-                    installed
-                        .extension_path
-                        .with_file_name(PI_EXTENSION_INSTALL_NAME)
-                        .display()
+                    path.display()
                 ));
             }
-            messages.push(format!(
-                "installed omp integration to {}",
-                installed.extension_path.display()
-            ));
+            for path in installed.extension_paths {
+                messages.push(format!("installed omp integration to {}", path.display()));
+            }
             messages
         }
         crate::api::schema::IntegrationTarget::Claude => {
@@ -233,16 +229,17 @@ pub(crate) fn uninstall_target(
         }
         crate::api::schema::IntegrationTarget::Omp => {
             let result = uninstall_omp()?;
-            if result.removed_extension {
-                vec![format!(
-                    "removed omp integration extension at {}",
-                    result.extension_path.display()
-                )]
-            } else {
+            if result.removed_extension_paths.is_empty() {
                 vec![format!(
                     "no omp integration extension found at {}",
-                    result.extension_path.display()
+                    result.extension_paths[0].display()
                 )]
+            } else {
+                result
+                    .removed_extension_paths
+                    .into_iter()
+                    .map(|path| format!("removed omp integration extension at {}", path.display()))
+                    .collect()
             }
         }
         crate::api::schema::IntegrationTarget::Claude => {
