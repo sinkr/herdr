@@ -97,7 +97,7 @@
             ];
 
             env = {
-              LIBGHOSTTY_VT_OPTIMIZE = "Debug";
+              LIBGHOSTTY_VT_OPTIMIZE = "ReleaseFast"; # Debug VT core turns grapheme-heavy panes quadratic (verifyIntegrity); override locally when hunting VT bugs
               LIBGHOSTTY_VT_SIMD = "true";
             };
           };
