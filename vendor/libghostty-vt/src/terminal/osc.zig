@@ -302,6 +302,13 @@ pub const Parser = struct {
     /// reasonably exceed MAX_BUF.
     alloc: ?Allocator,
 
+    /// Maximum bytes an OSC 5522 (kitty clipboard protocol) body can
+    /// accumulate. Enhanced-paste payloads are much larger than other
+    /// OSC commands, so they get a dedicated cap instead of relying on
+    /// allocator exhaustion. Sequences that exceed the cap are dropped
+    /// entirely (never surfaced truncated).
+    max_bytes_5522: usize = 20 * 1024 * 1024,
+
     /// Current state of the parser.
     state: State,
 
@@ -551,6 +558,16 @@ pub const Parser = struct {
         // If a writer has been initialized, we just accumulate the rest of the
         // OSC sequence in the writer's buffer and skip the state machine.
         if (self.capture) |*cap| {
+            // OSC 5522 bodies (enhanced paste payloads) can be huge; cap
+            // them so a broken or hostile program cannot grow the capture
+            // buffer without bound. An over-cap sequence is dropped
+            // entirely (never surfaced truncated).
+            if (self.state == .@"5522" and cap.trailing().len >= self.max_bytes_5522) {
+                cap.deinit();
+                self.capture = null;
+                self.state = .invalid;
+                return;
+            }
             cap.writer.writeByte(c) catch |err| switch (err) {
                 // We have overflowed our buffer or had some other error, set the
                 // state to invalid so that we discard any further input.

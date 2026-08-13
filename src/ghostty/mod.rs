@@ -194,6 +194,18 @@ pub(crate) const KITTY_UNICODE_PLACEHOLDER: u32 = 0x10EEEE;
 const KITTY_PLACEMENT_DATA_IS_VIRTUAL: ffi::GhosttyKittyGraphicsPlacementData = 3;
 const KITTY_PLACEMENT_DATA_COLUMNS: ffi::GhosttyKittyGraphicsPlacementData = 10;
 const KITTY_PLACEMENT_DATA_ROWS: ffi::GhosttyKittyGraphicsPlacementData = 11;
+// The vendored C header exposes GHOSTTY_TERMINAL_OPT_SIXEL, but the checked-in
+// generated bindings predate it. Keep the explicit value aligned with
+// vendor/libghostty-vt/include/ghostty/vt/terminal.h.
+const TERMINAL_OPT_SIXEL: ffi::GhosttyTerminalOption = 27;
+/// Largest single Sixel passthrough sequence the Zig side will surface.
+/// Kept in sync with `max_bytes_sixel` in vendor .../terminal/dcs.zig.
+pub const SIXEL_MAX_SEQUENCE_BYTES: usize = 8 * 1024 * 1024;
+/// Same story for GHOSTTY_TERMINAL_OPT_OSC5522.
+const TERMINAL_OPT_OSC5522: ffi::GhosttyTerminalOption = 28;
+/// Largest single OSC 5522 passthrough sequence the Zig side will surface.
+/// Kept in sync with `max_bytes_5522` in vendor .../terminal/osc.zig.
+pub const OSC5522_MAX_SEQUENCE_BYTES: usize = 20 * 1024 * 1024;
 
 static INSTALL_PNG_DECODER: Once = Once::new();
 static KITTY_PLACEHOLDER_DIACRITICS: OnceLock<HashMap<u32, u32>> = OnceLock::new();
@@ -467,12 +479,25 @@ type WritePtyCallback = dyn FnMut(&[u8]) + Send;
 
 const MAX_CLIPBOARD_BYTES: usize = 192 * 1024;
 
+/// A complete Sixel DCS sequence surfaced by the terminal for passthrough.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SixelEmission {
+    /// 0-based cursor row in the active screen area when the sequence started.
+    pub row: u16,
+    /// 0-based cursor column in the active screen area when the sequence started.
+    pub col: u16,
+    /// The full re-synthesized sequence bytes (`ESC P .. q .. ESC \`).
+    pub data: Vec<u8>,
+}
+
 #[derive(Default)]
 struct TerminalCallbackState {
     write_pty: Option<Box<WritePtyCallback>>,
     bell_count: u16,
     pwd_changes: Vec<Vec<u8>>,
     clipboard_writes: Vec<Vec<u8>>,
+    sixel_emissions: Vec<SixelEmission>,
+    osc5522_emissions: Vec<Vec<u8>>,
     size_report: ffi::GhosttySizeReportSize,
     color_scheme: Option<ColorScheme>,
 }
@@ -484,6 +509,42 @@ unsafe extern "C" fn bell_trampoline(_terminal: ffi::GhosttyTerminal, userdata: 
     // SAFETY: userdata is the TerminalCallbackState installed with this terminal.
     let state = unsafe { &mut *userdata.cast::<TerminalCallbackState>() };
     state.bell_count = state.bell_count.saturating_add(1);
+}
+
+unsafe extern "C" fn sixel_trampoline(
+    _terminal: ffi::GhosttyTerminal,
+    userdata: *mut c_void,
+    data: *const u8,
+    len: usize,
+    row: u16,
+    col: u16,
+) {
+    if userdata.is_null() || data.is_null() || len == 0 || len > SIXEL_MAX_SEQUENCE_BYTES {
+        return;
+    }
+    // SAFETY: userdata is the TerminalCallbackState installed with this terminal;
+    // the sequence bytes are only valid for the duration of the callback.
+    let state = unsafe { &mut *userdata.cast::<TerminalCallbackState>() };
+    let data = unsafe { slice::from_raw_parts(data, len) }.to_vec();
+    state.sixel_emissions.push(SixelEmission { row, col, data });
+}
+
+/// OSC 5522 sequences allow a larger sequence cap plus the framing bytes;
+/// give the trampoline check a little slack over the body cap.
+unsafe extern "C" fn osc5522_trampoline(
+    _terminal: ffi::GhosttyTerminal,
+    userdata: *mut c_void,
+    data: *const u8,
+    len: usize,
+) {
+    if userdata.is_null() || data.is_null() || len == 0 || len > OSC5522_MAX_SEQUENCE_BYTES + 64 {
+        return;
+    }
+    // SAFETY: userdata is the TerminalCallbackState installed with this terminal;
+    // the sequence bytes are only valid for the duration of the callback.
+    let state = unsafe { &mut *userdata.cast::<TerminalCallbackState>() };
+    let data = unsafe { slice::from_raw_parts(data, len) }.to_vec();
+    state.osc5522_emissions.push(data);
 }
 
 unsafe extern "C" fn color_scheme_trampoline(
@@ -856,6 +917,18 @@ impl Terminal {
             .into_result()?;
             ffi::ghostty_terminal_set(
                 terminal.raw,
+                TERMINAL_OPT_SIXEL,
+                (sixel_trampoline as *const ()).cast(),
+            )
+            .into_result()?;
+            ffi::ghostty_terminal_set(
+                terminal.raw,
+                TERMINAL_OPT_OSC5522,
+                (osc5522_trampoline as *const ()).cast(),
+            )
+            .into_result()?;
+            ffi::ghostty_terminal_set(
+                terminal.raw,
                 ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_GLYPH_PROTOCOL,
                 (&glyph_protocol as *const bool).cast(),
             )
@@ -1005,6 +1078,14 @@ impl Terminal {
 
     pub fn take_clipboard_writes(&mut self) -> Vec<Vec<u8>> {
         mem::take(&mut self.callback_state.clipboard_writes)
+    }
+
+    pub fn take_sixel_emissions(&mut self) -> Vec<SixelEmission> {
+        mem::take(&mut self.callback_state.sixel_emissions)
+    }
+
+    pub fn take_osc5522_emissions(&mut self) -> Vec<Vec<u8>> {
+        mem::take(&mut self.callback_state.osc5522_emissions)
     }
 
     pub fn mode_get(&self, mode: u16) -> Result<bool, Error> {
@@ -4053,6 +4134,45 @@ mod tests {
 
         terminal.write(b"\x1b]52;c;\x07");
         assert!(terminal.take_clipboard_writes().is_empty());
+    }
+
+    #[test]
+    fn libghostty_surfaces_complete_sixel_sequences_with_cursor() {
+        let mut terminal = Terminal::new(20, 5, 0).unwrap();
+        // Split the sequence across writes to prove buffering across
+        // vt_write boundaries.
+        terminal.write(b"hello\x1bP0;0;8q\"1;1;4;4");
+        assert!(terminal.take_sixel_emissions().is_empty());
+        terminal.write(b"#0;2;0;0;0#0!4~-!4~\x1b\\world");
+        let emissions = terminal.take_sixel_emissions();
+        assert_eq!(
+            emissions,
+            vec![SixelEmission {
+                row: 0,
+                col: 5,
+                data: b"\x1bP0;0;8q\"1;1;4;4#0;2;0;0;0#0!4~-!4~\x1b\\".to_vec(),
+            }]
+        );
+        // The DCS payload must not corrupt the text grid.
+        assert_eq!(first_rendered_row_text(&terminal), "helloworld");
+        // One-shot: nothing left after draining.
+        assert!(terminal.take_sixel_emissions().is_empty());
+    }
+
+    #[test]
+    fn libghostty_surfaces_complete_osc5522_sequences() {
+        let mut terminal = Terminal::new(20, 5, 0).unwrap();
+        // Split the sequence across writes to prove buffering across
+        // vt_write boundaries.
+        terminal.write(b"hello\x1b]5522;type=re");
+        assert!(terminal.take_osc5522_emissions().is_empty());
+        terminal.write(b"ad:pw=abc\x07world");
+        let emissions = terminal.take_osc5522_emissions();
+        assert_eq!(emissions, vec![b"\x1b]5522;type=read:pw=abc\x07".to_vec()]);
+        // The OSC payload must not corrupt the text grid.
+        assert_eq!(first_rendered_row_text(&terminal), "helloworld");
+        // One-shot: nothing left after draining.
+        assert!(terminal.take_osc5522_emissions().is_empty());
     }
 
     #[test]

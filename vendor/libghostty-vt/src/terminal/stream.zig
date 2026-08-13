@@ -127,6 +127,7 @@ pub const Action = union(Key) {
     kitty_color_report: kitty.color.OSC,
     color_operation: ColorOperation,
     semantic_prompt: SemanticPrompt,
+    kitty_clipboard: KittyClipboard,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -226,6 +227,7 @@ pub const Action = union(Key) {
             "kitty_color_report",
             "color_operation",
             "semantic_prompt",
+            "kitty_clipboard",
         },
     );
 
@@ -438,6 +440,11 @@ pub const Action = union(Key) {
     };
 
     pub const SemanticPrompt = osc.Command.SemanticPrompt;
+
+    /// OSC 5522 (kitty clipboard protocol / enhanced paste). Handlers
+    /// receive the parsed metadata/payload split; the memory is only
+    /// valid for the duration of the dispatch.
+    pub const KittyClipboard = osc.Command.KittyClipboardProtocol;
 };
 
 /// Returns a type that can process a stream of tty control characters.
@@ -2374,11 +2381,14 @@ pub fn Stream(comptime H: type) type {
                 .conemu_output_environment_variable,
                 .conemu_run_process,
                 .kitty_text_sizing,
-                .kitty_clipboard_protocol,
                 .kitty_dnd_protocol,
                 .context_signal,
                 => {
                     log.debug("unimplemented OSC callback: {}", .{cmd});
+                },
+
+                .kitty_clipboard_protocol => |v| {
+                    self.handler.vt(.kitty_clipboard, v);
                 },
 
                 .invalid => {

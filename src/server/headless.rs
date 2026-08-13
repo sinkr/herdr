@@ -283,6 +283,18 @@ enum AltScreenReadConflict {
     Defer,
 }
 
+/// Watermark movements produced by gathering one pane's pending passthrough
+/// emissions (Sixel or raw OSC) for one client. See
+/// [`HeadlessServer::collect_client_pane_sixels`] and
+/// [`HeadlessServer::collect_client_pane_raw_osc`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PassthroughCollectOutcome {
+    /// First-sight baseline to record on the client immediately.
+    init: Option<u64>,
+    /// Delivery watermark to commit once the carrying frame is sent.
+    delivered: Option<u64>,
+}
+
 /// The headless server — runs the herdr event loop without a real terminal.
 pub struct HeadlessServer {
     app: app::App,
@@ -4299,6 +4311,25 @@ impl HeadlessServer {
             ) else {
                 retained_fallback!("missing_runtime");
             };
+            // Pending Sixel passthrough emissions ride full-render frames
+            // only (spliced bytes for TerminalAnsi clients, positioned
+            // records for SemanticFrame clients); fall back so they are
+            // delivered promptly.
+            if runtime.has_pending_sixels_after(
+                client
+                    .sixel_watermarks
+                    .get(&info.id)
+                    .copied()
+                    .unwrap_or(0),
+            ) {
+                retained_fallback!("pending_sixel");
+            }
+            // Same for pending raw OSC passthrough emissions.
+            if runtime.has_pending_osc5522_after(
+                client.osc_watermarks.get(&info.id).copied().unwrap_or(0),
+            ) {
+                retained_fallback!("pending_raw_osc");
+            }
             match runtime.collect_dirty_patch(info.inner_rect.width, info.inner_rect.height) {
                 crate::pane::TerminalDirtyPatchOutcome::Clean => {
                     crate::render_prof::event("retained.pane_clean");
@@ -4429,6 +4460,184 @@ impl HeadlessServer {
         }
     }
 
+    /// Gathers one pane's pending Sixel emissions for one client.
+    ///
+    /// TerminalAnsi clients receive pre-encoded DECSC + CUP + DECRC byte
+    /// splices in `sixel_bytes`; SemanticFrame clients receive positioned
+    /// [`protocol::SixelSplice`] records in `sixel_splices`, resolved
+    /// against `pane_rect` (the pane's content rect in the frame being
+    /// rendered). The 9 MiB per-frame budget is shared across both shapes
+    /// and all panes of the frame.
+    ///
+    /// `watermark` is the client's recorded per-pane delivery watermark;
+    /// `None` means this client sees the pane for the first time. The
+    /// returned [`PassthroughCollectOutcome::init`] baseline snapshot MUST
+    /// be recorded on the client immediately — first sight is a fact about
+    /// this frame pass, not about frame delivery — while
+    /// [`PassthroughCollectOutcome::delivered`] commits only after the frame
+    /// carrying the payload was actually sent.
+    fn collect_client_pane_sixels(
+        watermark: Option<u64>,
+        terminal_ansi: bool,
+        runtime: &crate::terminal::TerminalRuntime,
+        pane_id: crate::layout::PaneId,
+        pane_rect: Rect,
+        sixel_bytes: &mut Vec<u8>,
+        sixel_splices: &mut Vec<protocol::SixelSplice>,
+    ) -> PassthroughCollectOutcome {
+        /// Per-frame byte budget for Sixel passthrough payloads. Large
+        /// enough that any single emission (capped at 8 MiB by the
+        /// terminal) always fits, so delivery is guaranteed to progress.
+        const SIXEL_FRAME_BUDGET: usize = 9 * 1024 * 1024;
+        /// Budget slack per splice record, matching the pane-side estimate.
+        const SIXEL_SPLICE_SLACK: usize = 32;
+
+        let (watermark, init) = match watermark {
+            Some(watermark) => (watermark, None),
+            None => {
+                let latest = runtime.latest_sixel_seq();
+                (latest, Some(latest))
+            }
+        };
+        let advanced = if terminal_ansi {
+            runtime.encode_pending_sixels_after(
+                watermark,
+                (pane_rect.x, pane_rect.y),
+                SIXEL_FRAME_BUDGET,
+                sixel_bytes,
+            )
+        } else {
+            let used = sixel_splices
+                .iter()
+                .map(|splice| splice.data.len() + SIXEL_SPLICE_SLACK)
+                .sum();
+            let mut pending = Vec::new();
+            let advanced = runtime.collect_pending_sixels_after(
+                watermark,
+                used,
+                SIXEL_FRAME_BUDGET,
+                &mut pending,
+            );
+            sixel_splices.extend(pending.into_iter().map(|pending| protocol::SixelSplice {
+                pane_id: pane_id.raw(),
+                rect: protocol::SixelPaneRect {
+                    x: pane_rect.x,
+                    y: pane_rect.y,
+                    width: pane_rect.width,
+                    height: pane_rect.height,
+                },
+                row: pending.row,
+                col: pending.col,
+                data: pending.data,
+            }));
+            advanced
+        };
+        PassthroughCollectOutcome {
+            init,
+            delivered: (advanced > watermark).then_some(advanced),
+        }
+    }
+
+    /// Gathers one pane's pending raw OSC 5522 emissions for one client.
+    ///
+    /// TerminalAnsi clients receive the sequences verbatim in `osc_bytes`
+    /// (no positioning wrap; the payload is location-independent);
+    /// SemanticFrame clients receive [`protocol::RawOsc`] records in
+    /// `osc_records`. The 4 MiB per-frame budget is shared across both
+    /// shapes and all panes of the frame; an emission that alone exceeds
+    /// the budget is dropped by the pane-side fold so delivery always
+    /// progresses.
+    ///
+    /// Watermark discipline is identical to
+    /// [`Self::collect_client_pane_sixels`].
+    fn collect_client_pane_raw_osc(
+        watermark: Option<u64>,
+        terminal_ansi: bool,
+        runtime: &crate::terminal::TerminalRuntime,
+        pane_id: crate::layout::PaneId,
+        osc_bytes: &mut Vec<u8>,
+        osc_records: &mut Vec<protocol::RawOsc>,
+    ) -> PassthroughCollectOutcome {
+        /// Per-frame byte budget for raw OSC passthrough payloads. The
+        /// pane-emitted 5522 packets (read requests, statuses) are small;
+        /// oversized outliers are dropped rather than wedging delivery.
+        const RAW_OSC_FRAME_BUDGET: usize = 4 * 1024 * 1024;
+        /// Budget slack per record, matching the pane-side estimate.
+        const RAW_OSC_RECORD_SLACK: usize = 32;
+
+        let (watermark, init) = match watermark {
+            Some(watermark) => (watermark, None),
+            None => {
+                let latest = runtime.latest_osc5522_seq();
+                (latest, Some(latest))
+            }
+        };
+        let advanced = if terminal_ansi {
+            runtime.encode_pending_osc5522_after(watermark, RAW_OSC_FRAME_BUDGET, osc_bytes)
+        } else {
+            let used = osc_records
+                .iter()
+                .map(|record| record.data.len() + RAW_OSC_RECORD_SLACK)
+                .sum();
+            let mut pending = Vec::new();
+            let advanced = runtime.collect_pending_osc5522_after(
+                watermark,
+                used,
+                RAW_OSC_FRAME_BUDGET,
+                &mut pending,
+            );
+            osc_records.extend(pending.into_iter().map(|pending| protocol::RawOsc {
+                pane_id: pane_id.raw(),
+                data: pending.data,
+            }));
+            advanced
+        };
+        PassthroughCollectOutcome {
+            init,
+            delivered: (advanced > watermark).then_some(advanced),
+        }
+    }
+
+    /// Applies one pane's Sixel [`PassthroughCollectOutcome`] to the client:
+    /// first-sight watermark baselines land immediately; delivery watermarks
+    /// queue in `sixel_commits` until the carrying frame is sent.
+    fn record_sixel_outcome(
+        &mut self,
+        client_id: u64,
+        pane_id: crate::layout::PaneId,
+        outcome: PassthroughCollectOutcome,
+        sixel_commits: &mut Vec<(crate::layout::PaneId, u64)>,
+    ) {
+        if let Some(init) = outcome.init {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.sixel_watermarks.insert(pane_id, init);
+            }
+        }
+        if let Some(delivered) = outcome.delivered {
+            sixel_commits.push((pane_id, delivered));
+        }
+    }
+
+    /// Applies one pane's raw OSC [`PassthroughCollectOutcome`] to the
+    /// client: first-sight watermark baselines land immediately; delivery
+    /// watermarks queue in `osc_commits` until the carrying frame is sent.
+    fn record_raw_osc_outcome(
+        &mut self,
+        client_id: u64,
+        pane_id: crate::layout::PaneId,
+        outcome: PassthroughCollectOutcome,
+        osc_commits: &mut Vec<(crate::layout::PaneId, u64)>,
+    ) {
+        if let Some(init) = outcome.init {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.osc_watermarks.insert(pane_id, init);
+            }
+        }
+        if let Some(delivered) = outcome.delivered {
+            osc_commits.push((pane_id, delivered));
+        }
+    }
+
     fn render_and_stream(&mut self) {
         let full_started = crate::render_prof::timer();
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
@@ -4460,7 +4669,7 @@ impl HeadlessServer {
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
-            let mut frame = match mode {
+            let mut frame = match &mode {
                 ClientConnectionMode::App => {
                     let render_started = crate::render_prof::timer();
                     let render_cell_size =
@@ -4513,7 +4722,7 @@ impl HeadlessServer {
                 }
                 ClientConnectionMode::TerminalAttach { terminal_id }
                 | ClientConnectionMode::TerminalObserve { terminal_id } => {
-                    let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) else {
+                    let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) else {
                         self.send_to_client(
                             client_id,
                             ServerMessage::ServerShutdown {
@@ -4548,6 +4757,131 @@ impl HeadlessServer {
                     frame
                 }
             };
+
+            // One-shot passthrough (Sixel splices and raw OSC records):
+            // gather emissions newer than this client's per-pane watermark
+            // — pre-encoded splice bytes for TerminalAnsi clients,
+            // records riding the frame message for SemanticFrame clients. A
+            // pane first seen by this client snapshots the pane's newest
+            // sequence as its watermark immediately (emissions from before
+            // first sight never replay), so a skipped or undeliverable frame
+            // can never swallow a later emission. Delivery watermarks commit
+            // only after the frame carrying the payload is actually sent, so
+            // send failures re-deliver on the next frame.
+            let mut sixel_bytes: Vec<u8> = Vec::new();
+            let mut sixel_splices: Vec<protocol::SixelSplice> = Vec::new();
+            let mut sixel_commits: Vec<(crate::layout::PaneId, u64)> = Vec::new();
+            let mut osc_bytes: Vec<u8> = Vec::new();
+            let mut osc_records: Vec<protocol::RawOsc> = Vec::new();
+            let mut osc_commits: Vec<(crate::layout::PaneId, u64)> = Vec::new();
+            let client_is_terminal_ansi = self
+                .clients
+                .get(&client_id)
+                .is_some_and(|client| client.render_state.is_terminal_ansi());
+            match &mode {
+                ClientConnectionMode::App => {
+                    if self.app.state.mode == app::Mode::Terminal {
+                        if let Some(ws_idx) = self.app.state.active {
+                            let pane_infos = self.app.state.view.pane_infos.clone();
+                            for info in pane_infos {
+                                let watermark = self.clients[&client_id]
+                                    .sixel_watermarks
+                                    .get(&info.id)
+                                    .copied();
+                                let osc_watermark = self.clients[&client_id]
+                                    .osc_watermarks
+                                    .get(&info.id)
+                                    .copied();
+                                let Some(runtime) =
+                                    self.app.state.runtime_for_pane_in_workspace(
+                                        &self.app.terminal_runtimes,
+                                        ws_idx,
+                                        info.id,
+                                    )
+                                else {
+                                    continue;
+                                };
+                                let outcome = Self::collect_client_pane_sixels(
+                                    watermark,
+                                    client_is_terminal_ansi,
+                                    runtime,
+                                    info.id,
+                                    info.inner_rect,
+                                    &mut sixel_bytes,
+                                    &mut sixel_splices,
+                                );
+                                let osc_outcome = Self::collect_client_pane_raw_osc(
+                                    osc_watermark,
+                                    client_is_terminal_ansi,
+                                    runtime,
+                                    info.id,
+                                    &mut osc_bytes,
+                                    &mut osc_records,
+                                );
+                                self.record_sixel_outcome(
+                                    client_id,
+                                    info.id,
+                                    outcome,
+                                    &mut sixel_commits,
+                                );
+                                self.record_raw_osc_outcome(
+                                    client_id,
+                                    info.id,
+                                    osc_outcome,
+                                    &mut osc_commits,
+                                );
+                            }
+                        }
+                    }
+                }
+                ClientConnectionMode::TerminalAttach { terminal_id }
+                | ClientConnectionMode::TerminalObserve { terminal_id } => {
+                    let mut collected = None;
+                    if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
+                        let pane_id = runtime.pane_id();
+                        let watermark = self.clients[&client_id]
+                            .sixel_watermarks
+                            .get(&pane_id)
+                            .copied();
+                        let osc_watermark = self.clients[&client_id]
+                            .osc_watermarks
+                            .get(&pane_id)
+                            .copied();
+                        let outcome = Self::collect_client_pane_sixels(
+                            watermark,
+                            client_is_terminal_ansi,
+                            runtime,
+                            pane_id,
+                            Rect::new(0, 0, cols, rows),
+                            &mut sixel_bytes,
+                            &mut sixel_splices,
+                        );
+                        let osc_outcome = Self::collect_client_pane_raw_osc(
+                            osc_watermark,
+                            client_is_terminal_ansi,
+                            runtime,
+                            pane_id,
+                            &mut osc_bytes,
+                            &mut osc_records,
+                        );
+                        collected = Some((pane_id, outcome, osc_outcome));
+                    }
+                    if let Some((pane_id, outcome, osc_outcome)) = collected {
+                        self.record_sixel_outcome(
+                            client_id,
+                            pane_id,
+                            outcome,
+                            &mut sixel_commits,
+                        );
+                        self.record_raw_osc_outcome(
+                            client_id,
+                            pane_id,
+                            osc_outcome,
+                            &mut osc_commits,
+                        );
+                    }
+                }
+            }
 
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
@@ -4607,8 +4941,18 @@ impl HeadlessServer {
                 commit_graphics_cache = false;
                 encoded.incomplete = false;
             }
-            let has_graphics = !frame.graphics.is_empty();
-            let Some(mut prepared) = client.render_state.prepare_frame(frame) else {
+            let has_graphics = !frame.graphics.is_empty()
+                || !sixel_bytes.is_empty()
+                || !sixel_splices.is_empty()
+                || !osc_bytes.is_empty()
+                || !osc_records.is_empty();
+            let Some(mut prepared) = client.render_state.prepare_frame_with_sixels(
+                frame,
+                &sixel_bytes,
+                std::mem::take(&mut sixel_splices),
+                &osc_bytes,
+                std::mem::take(&mut osc_records),
+            ) else {
                 if commit_graphics_cache {
                     client.graphics_cache = next_graphics_cache;
                     client.graphics_surface_reset_pending = false;
@@ -4618,6 +4962,16 @@ impl HeadlessServer {
                     deferred_frame = true;
                 } else {
                     client.clear_deferred_render();
+                }
+                // A skip is impossible while a passthrough payload is
+                // pending, so any recorded watermark advances are
+                // oversized-emission drops: commit them now so the dead
+                // emissions are not re-scanned on every future frame.
+                for (pane_id, watermark) in sixel_commits.drain(..) {
+                    client.sixel_watermarks.insert(pane_id, watermark);
+                }
+                for (pane_id, watermark) in osc_commits.drain(..) {
+                    client.osc_watermarks.insert(pane_id, watermark);
                 }
                 crate::render_prof::event("full_render.skip_identical");
                 continue;
@@ -4639,6 +4993,12 @@ impl HeadlessServer {
                         continue;
                     };
                     text_only_frame.graphics.clear();
+                    // Passthrough payloads (spliced bytes or semantic
+                    // records in the discarded `prepared`) ride the dropped
+                    // frame too; keep their delivery watermarks unmoved so
+                    // they retry on the next frame.
+                    sixel_commits.clear();
+                    osc_commits.clear();
                     let Some(text_only_prepared) =
                         client.render_state.prepare_frame(text_only_frame)
                     else {
@@ -4682,6 +5042,12 @@ impl HeadlessServer {
                         client.graphics_surface_reset_pending = false;
                     }
                     client.render_state.commit_sent_frame(prepared);
+                    for (pane_id, watermark) in sixel_commits.drain(..) {
+                        client.sixel_watermarks.insert(pane_id, watermark);
+                    }
+                    for (pane_id, watermark) in osc_commits.drain(..) {
+                        client.osc_watermarks.insert(pane_id, watermark);
+                    }
                     if encoded.incomplete {
                         client.defer_full_render();
                         deferred_frame = true;
@@ -5361,13 +5727,18 @@ mod tests {
         app.local_terminal_notifications = false;
         app.local_input_source_switch = false;
 
+        // Timestamps alone collide when parallel test threads start within
+        // the clock's resolution; a per-process sequence keeps paths unique.
+        static TEST_SOCKET_SEQ: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "hh-{}-{}",
+            "hh-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            TEST_SOCKET_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = fs::create_dir_all(&dir);
         let socket_path = dir.join("client.sock");
@@ -5435,7 +5806,25 @@ mod tests {
         match protocol::read_message(&mut std::io::Cursor::new(bytes), MAX_GRAPHICS_FRAME_SIZE)
             .expect("decode server frame")
         {
-            ServerMessage::Frame(frame) => frame,
+            ServerMessage::Frame { frame, .. } => frame,
+            other => panic!("expected frame, got {other:?}"),
+        }
+    }
+
+    fn read_server_frame_with_sixels(bytes: Vec<u8>) -> (FrameData, Vec<protocol::SixelSplice>) {
+        match protocol::read_message(&mut std::io::Cursor::new(bytes), MAX_GRAPHICS_FRAME_SIZE)
+            .expect("decode server frame")
+        {
+            ServerMessage::Frame { frame, sixels, .. } => (frame, sixels),
+            other => panic!("expected frame, got {other:?}"),
+        }
+    }
+
+    fn read_server_frame_with_raw_osc(bytes: Vec<u8>) -> (FrameData, Vec<protocol::RawOsc>) {
+        match protocol::read_message(&mut std::io::Cursor::new(bytes), MAX_GRAPHICS_FRAME_SIZE)
+            .expect("decode server frame")
+        {
+            ServerMessage::Frame { frame, raw_osc, .. } => (frame, raw_osc),
             other => panic!("expected frame, got {other:?}"),
         }
     }
@@ -9502,7 +9891,7 @@ next_tab = ""
         );
         assert!(matches!(
             read_server_message(client_rx.recv_timeout(Duration::from_millis(100)).unwrap()),
-            ServerMessage::Frame(_)
+            ServerMessage::Frame { .. }
         ));
     }
 
@@ -9876,6 +10265,274 @@ next_tab = ""
         );
         assert!(patched.cells.iter().any(|cell| cell.symbol == "Z"));
         assert_eq!((patched.width, patched.height), (80, 24));
+    }
+
+    /// Full Sixel DCS sequence, byte-identical to what the pane queues.
+    const SEMANTIC_SIXEL: &[u8] = b"\x1bP0;0;8q\"1;1;4;4#0;2;0;0;0#0!4~-!4~\x1b\\";
+
+    #[tokio::test]
+    async fn sixel_passthrough_rides_semantic_frame_exactly_once() {
+        let (mut server, client_rx, pane_id) = retained_test_server(b"hello");
+
+        // First frame: no emissions yet; first sight of the pane records
+        // the watermark baseline immediately.
+        server.render_and_stream();
+        let (_, sixels) = read_server_frame_with_sixels(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
+        assert!(sixels.is_empty());
+        assert_eq!(
+            server.clients[&1].sixel_watermarks.get(&pane_id),
+            Some(&0)
+        );
+
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(SEMANTIC_SIXEL);
+
+        // The emission rides the next semantic frame exactly once, resolved
+        // against the pane's on-screen content rect, even though the text
+        // grid is unchanged.
+        server.render_and_stream();
+        let (_, sixels) = read_server_frame_with_sixels(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("sixel frame"),
+        );
+        let inner_rect = server.app.state.view.pane_infos[0].inner_rect;
+        assert_eq!(sixels.len(), 1);
+        assert_eq!(sixels[0].pane_id, pane_id.raw());
+        assert_eq!(
+            sixels[0].rect,
+            protocol::SixelPaneRect {
+                x: inner_rect.x,
+                y: inner_rect.y,
+                width: inner_rect.width,
+                height: inner_rect.height,
+            }
+        );
+        // Cursor sat after "hello" when the DCS was dispatched.
+        assert_eq!((sixels[0].row, sixels[0].col), (0, 5));
+        assert_eq!(sixels[0].data, SEMANTIC_SIXEL);
+        assert_eq!(
+            server.clients[&1].sixel_watermarks.get(&pane_id),
+            Some(&1)
+        );
+
+        // Later frames never replay the delivered emission.
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(b" again");
+        server.render_and_stream();
+        let (_, sixels) = read_server_frame_with_sixels(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("follow-up frame"),
+        );
+        assert!(sixels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sixel_semantic_watermark_commits_only_after_send_success() {
+        let (mut server, client_rx, pane_id) = retained_test_server(b"hello");
+
+        server.render_and_stream();
+        let _ = client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial frame");
+
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(SEMANTIC_SIXEL);
+
+        // Fill the render channel so the frame carrying the splice fails to
+        // send: the delivery watermark must stay unmoved.
+        let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadSoundConfig)
+            .expect("serialize dummy message");
+        server.clients[&1]
+            .writer
+            .as_ref()
+            .unwrap()
+            .test_fill_render(queued);
+        server.render_and_stream();
+        assert_eq!(
+            server.clients[&1].sixel_watermarks.get(&pane_id),
+            Some(&0)
+        );
+
+        // Drain the queue; the next frame re-delivers the splice and only
+        // then commits the watermark.
+        assert!(matches!(
+            read_server_message(client_rx.recv_timeout(Duration::from_millis(100)).unwrap()),
+            ServerMessage::ReloadSoundConfig
+        ));
+        server.render_and_stream();
+        let (_, sixels) = read_server_frame_with_sixels(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("redelivered sixel frame"),
+        );
+        assert_eq!(sixels.len(), 1);
+        assert_eq!(sixels[0].data, SEMANTIC_SIXEL);
+        assert_eq!(
+            server.clients[&1].sixel_watermarks.get(&pane_id),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn sixel_first_sight_watermark_survives_failed_frame_send() {
+        let (mut server, client_rx, pane_id) = retained_test_server(b"hello");
+
+        // The very first frame pass fails to send. First-sight watermark
+        // initialization must land anyway; deferring it to send success
+        // would let the later emission be swallowed by a re-initialization.
+        let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadSoundConfig)
+            .expect("serialize dummy message");
+        server.clients[&1]
+            .writer
+            .as_ref()
+            .unwrap()
+            .test_fill_render(queued);
+        server.render_and_stream();
+        assert_eq!(
+            server.clients[&1].sixel_watermarks.get(&pane_id),
+            Some(&0)
+        );
+
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(SEMANTIC_SIXEL);
+
+        assert!(matches!(
+            read_server_message(client_rx.recv_timeout(Duration::from_millis(100)).unwrap()),
+            ServerMessage::ReloadSoundConfig
+        ));
+        server.render_and_stream();
+        let (_, sixels) = read_server_frame_with_sixels(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("first delivered frame"),
+        );
+        assert_eq!(sixels.len(), 1, "emission after first sight must deliver");
+        assert_eq!(sixels[0].data, SEMANTIC_SIXEL);
+        assert_eq!(
+            server.clients[&1].sixel_watermarks.get(&pane_id),
+            Some(&1)
+        );
+    }
+
+    /// Full OSC 5522 sequence, byte-identical to what the pane queues.
+    const SEMANTIC_RAW_OSC: &[u8] = b"\x1b]5522;type=read:pw=abc\x07";
+
+    #[tokio::test]
+    async fn raw_osc_passthrough_rides_semantic_frame_exactly_once() {
+        let (mut server, client_rx, pane_id) = retained_test_server(b"hello");
+
+        // First frame: no emissions yet; first sight of the pane records
+        // the watermark baseline immediately.
+        server.render_and_stream();
+        let (_, raw_osc) = read_server_frame_with_raw_osc(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
+        assert!(raw_osc.is_empty());
+        assert_eq!(server.clients[&1].osc_watermarks.get(&pane_id), Some(&0));
+
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(SEMANTIC_RAW_OSC);
+
+        // The emission rides the next semantic frame exactly once even
+        // though the text grid is unchanged.
+        server.render_and_stream();
+        let (_, raw_osc) = read_server_frame_with_raw_osc(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("raw osc frame"),
+        );
+        assert_eq!(raw_osc.len(), 1);
+        assert_eq!(raw_osc[0].pane_id, pane_id.raw());
+        assert_eq!(raw_osc[0].data, SEMANTIC_RAW_OSC);
+        assert_eq!(server.clients[&1].osc_watermarks.get(&pane_id), Some(&1));
+
+        // Later frames never replay the delivered emission.
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(b" again");
+        server.render_and_stream();
+        let (_, raw_osc) = read_server_frame_with_raw_osc(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("follow-up frame"),
+        );
+        assert!(raw_osc.is_empty());
+    }
+
+    #[tokio::test]
+    async fn raw_osc_semantic_watermark_commits_only_after_send_success() {
+        let (mut server, client_rx, pane_id) = retained_test_server(b"hello");
+
+        server.render_and_stream();
+        let _ = client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial frame");
+
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(SEMANTIC_RAW_OSC);
+
+        // Fill the render channel so the frame carrying the record fails to
+        // send: the delivery watermark must stay unmoved.
+        let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadSoundConfig)
+            .expect("serialize dummy message");
+        server.clients[&1]
+            .writer
+            .as_ref()
+            .unwrap()
+            .test_fill_render(queued);
+        server.render_and_stream();
+        assert_eq!(server.clients[&1].osc_watermarks.get(&pane_id), Some(&0));
+
+        // Drain the queue; the next frame re-delivers the record and only
+        // then commits the watermark.
+        assert!(matches!(
+            read_server_message(client_rx.recv_timeout(Duration::from_millis(100)).unwrap()),
+            ServerMessage::ReloadSoundConfig
+        ));
+        server.render_and_stream();
+        let (_, raw_osc) = read_server_frame_with_raw_osc(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("redelivered raw osc frame"),
+        );
+        assert_eq!(raw_osc.len(), 1);
+        assert_eq!(raw_osc[0].data, SEMANTIC_RAW_OSC);
+        assert_eq!(server.clients[&1].osc_watermarks.get(&pane_id), Some(&1));
     }
 
     #[tokio::test]

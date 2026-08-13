@@ -55,6 +55,13 @@ pub(crate) struct ClientConnection {
     pub(crate) render_state: ClientRenderState,
     /// Client-local host Kitty graphics cache.
     pub(crate) graphics_cache: crate::kitty_graphics::HostGraphicsCache,
+    /// Per-pane watermark of the highest Sixel emission sequence sent to
+    /// this client. Emissions at or below the watermark are never re-sent.
+    pub(crate) sixel_watermarks: HashMap<crate::layout::PaneId, u64>,
+    /// Per-pane watermark of the highest raw OSC emission sequence sent to
+    /// this client. Separate from `sixel_watermarks`: the two passthrough
+    /// streams advance independently.
+    pub(crate) osc_watermarks: HashMap<crate::layout::PaneId, u64>,
     /// Passive eligibility for audited local Kitty regular-file graphics.
     pub(crate) direct_graphics: bool,
     /// Whether this frontend preserves exact SGR pixel reports.
@@ -128,6 +135,8 @@ impl ClientConnection {
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
+            sixel_watermarks: HashMap::new(),
+            osc_watermarks: HashMap::new(),
             direct_graphics: false,
             pixel_mouse: false,
             graphics_surface_reset_pending: false,

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -45,6 +46,17 @@ const MODE_MOUSE_X10: u16 = 9;
 const MODE_MOUSE_PRESS_RELEASE: u16 = 1000;
 const MODE_MOUSE_BUTTON_MOTION: u16 = 1002;
 const MODE_MOUSE_ANY_MOTION: u16 = 1003;
+/// Bounds for the per-pane queue of Sixel passthrough emissions awaiting
+/// delivery to attached clients. Oldest emissions are dropped past either
+/// bound; delivery is one-shot so the queue only grows while no frame is
+/// being streamed.
+const SIXEL_PENDING_MAX_ENTRIES: usize = 32;
+const SIXEL_PENDING_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// Bounds for the per-pane queue of OSC 5522 passthrough emissions awaiting
+/// delivery to attached clients. Same discipline as the Sixel queue; the
+/// entries are fewer but individually larger (up to 20 MiB per sequence).
+const OSC5522_PENDING_MAX_ENTRIES: usize = 16;
+const OSC5522_PENDING_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScrollMetrics {
@@ -99,6 +111,32 @@ pub(crate) enum TerminalDirtyPatchOutcome {
     Clean,
     Patch(TerminalDirtyPatch),
     Fallback,
+}
+
+/// A Sixel passthrough emission queued on the pane until attached clients
+/// have each received it exactly once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingSixel {
+    /// Monotonically increasing per-pane sequence number; clients track a
+    /// per-pane watermark of the highest sequence they have been sent.
+    pub seq: u64,
+    /// 0-based cursor row in the pane's active area when the sequence started.
+    pub row: u16,
+    /// 0-based cursor column in the pane's active area when the sequence started.
+    pub col: u16,
+    /// Full Sixel DCS sequence bytes.
+    pub data: Vec<u8>,
+}
+
+/// An OSC 5522 (enhanced paste) passthrough emission queued on the pane
+/// until attached clients have each received it exactly once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingRawOsc {
+    /// Monotonically increasing per-pane sequence number; clients track a
+    /// per-pane watermark of the highest sequence they have been sent.
+    pub seq: u64,
+    /// Full OSC 5522 sequence bytes (`ESC ] 5522 ; ... terminator`).
+    pub data: Vec<u8>,
 }
 
 fn decscusr_cursor_shape(style: crate::ghostty::CursorVisualStyle, blinking: bool) -> u8 {
@@ -188,6 +226,14 @@ pub(crate) struct GhosttyPaneCore {
     decscusr_tracker: DecscusrTracker,
     cursor_settle_state: CursorPositionSettleState,
     windows_powershell_prompt_cwd_reporting: bool,
+    /// Sixel passthrough emissions awaiting one-shot delivery to clients.
+    sixel_pending: VecDeque<PendingSixel>,
+    /// Sequence number assigned to the next queued Sixel emission.
+    sixel_next_seq: u64,
+    /// OSC 5522 passthrough emissions awaiting one-shot delivery to clients.
+    osc5522_pending: VecDeque<PendingRawOsc>,
+    /// Sequence number assigned to the next queued OSC 5522 emission.
+    osc5522_next_seq: u64,
 }
 
 pub(crate) struct PaneTerminal {
@@ -504,6 +550,65 @@ impl PaneTerminal {
     {
         self.ghostty
             .kitty_image_placements_with_data_filter(needs_data)
+    }
+
+    pub fn has_pending_sixels_after(&self, after_seq: u64) -> bool {
+        self.ghostty.has_pending_sixels_after(after_seq)
+    }
+
+    pub fn latest_sixel_seq(&self) -> u64 {
+        self.ghostty.latest_sixel_seq()
+    }
+
+    pub fn encode_pending_sixels_after(
+        &self,
+        after_seq: u64,
+        origin: (u16, u16),
+        budget: usize,
+        out: &mut Vec<u8>,
+    ) -> u64 {
+        self.ghostty
+            .encode_pending_sixels_after(after_seq, origin, budget, out)
+    }
+
+    pub fn collect_pending_sixels_after(
+        &self,
+        after_seq: u64,
+        used: usize,
+        budget: usize,
+        out: &mut Vec<PendingSixel>,
+    ) -> u64 {
+        self.ghostty
+            .collect_pending_sixels_after(after_seq, used, budget, out)
+    }
+
+    pub fn has_pending_osc5522_after(&self, after_seq: u64) -> bool {
+        self.ghostty.has_pending_osc5522_after(after_seq)
+    }
+
+    pub fn latest_osc5522_seq(&self) -> u64 {
+        self.ghostty.latest_osc5522_seq()
+    }
+
+    pub fn encode_pending_osc5522_after(
+        &self,
+        after_seq: u64,
+        budget: usize,
+        out: &mut Vec<u8>,
+    ) -> u64 {
+        self.ghostty
+            .encode_pending_osc5522_after(after_seq, budget, out)
+    }
+
+    pub fn collect_pending_osc5522_after(
+        &self,
+        after_seq: u64,
+        used: usize,
+        budget: usize,
+        out: &mut Vec<PendingRawOsc>,
+    ) -> u64 {
+        self.ghostty
+            .collect_pending_osc5522_after(after_seq, used, budget, out)
     }
 
     pub fn apply_host_terminal_theme(&self, theme: crate::terminal_theme::TerminalTheme) {
@@ -1065,6 +1170,10 @@ impl GhosttyPaneTerminal {
                 decscusr_tracker: DecscusrTracker::default(),
                 cursor_settle_state: CursorPositionSettleState::default(),
                 windows_powershell_prompt_cwd_reporting: false,
+                sixel_pending: VecDeque::new(),
+                sixel_next_seq: 1,
+                osc5522_pending: VecDeque::new(),
+                osc5522_next_seq: 1,
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
@@ -1239,6 +1348,8 @@ impl GhosttyPaneTerminal {
         // Those effects must not be delivered as live pane output.
         let _ = core.terminal.take_bell_count();
         let _ = core.terminal.take_clipboard_writes();
+        let _ = core.terminal.take_sixel_emissions();
+        let _ = core.terminal.take_osc5522_emissions();
         let default_color_observation = core.default_color_tracker.observe(bytes);
         if shell_pid > 0 && default_color_observation {
             if let Some(owner_pgid) = current_transient_default_color_owner(shell_pid) {
@@ -1306,6 +1417,8 @@ impl GhosttyPaneTerminal {
         );
         let terminal_bells = core.terminal.take_bell_count();
         let clipboard_writes = core.terminal.take_clipboard_writes();
+        enqueue_pending_sixels(&mut core);
+        enqueue_pending_osc5522(&mut core);
         let reported_cwd = core
             .terminal
             .take_pwd_changes()
@@ -1440,6 +1553,217 @@ impl GhosttyPaneTerminal {
             .lock()
             .map(|mut responses| std::mem::take(&mut *responses))
             .unwrap_or_default()
+    }
+
+    /// Returns true when the pane has queued Sixel emissions newer than
+    /// `after_seq` that still need one-shot delivery.
+    pub fn has_pending_sixels_after(&self, after_seq: u64) -> bool {
+        self.core
+            .lock()
+            .map(|core| {
+                core.sixel_pending
+                    .back()
+                    .is_some_and(|pending| pending.seq > after_seq)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Sequence number of the newest queued Sixel emission (0 when none has
+    /// ever been queued). Used to initialize a client's watermark so newly
+    /// attached clients never replay old emissions.
+    pub fn latest_sixel_seq(&self) -> u64 {
+        self.core
+            .lock()
+            .map(|core| core.sixel_next_seq.saturating_sub(1))
+            .unwrap_or(0)
+    }
+
+    /// Walks queued Sixel emissions newer than `after_seq` under a per-frame
+    /// byte budget shared across a frame's panes (`used` counts bytes already
+    /// claimed by earlier panes), calling `emit` for each deliverable one.
+    /// Returns the new watermark. Emissions stay queued; callers advance
+    /// their recorded watermark to the returned sequence only after the
+    /// frame carrying the emissions was actually sent.
+    ///
+    /// The walk stops before an emission that would exceed the budget; an
+    /// emission that alone exceeds the budget is dropped (the watermark
+    /// advances past it) so delivery always makes progress.
+    fn fold_pending_sixels_after(
+        &self,
+        after_seq: u64,
+        mut used: usize,
+        budget: usize,
+        mut emit: impl FnMut(&PendingSixel),
+    ) -> u64 {
+        let Ok(core) = self.core.lock() else {
+            return after_seq;
+        };
+        let mut watermark = after_seq;
+        for pending in core.sixel_pending.iter() {
+            if pending.seq <= after_seq {
+                continue;
+            }
+            // Payload plus slack for the positioning wrap (DECSC + CUP
+            // digits + DECRC) or the splice record framing.
+            let encoded_len = pending.data.len() + 32;
+            if used.saturating_add(encoded_len) > budget {
+                if encoded_len > budget {
+                    // Never deliverable within any frame; drop it rather
+                    // than wedge delivery of everything behind it.
+                    debug!(
+                        seq = pending.seq,
+                        bytes = pending.data.len(),
+                        "dropping oversized pending sixel emission"
+                    );
+                    watermark = pending.seq;
+                    continue;
+                }
+                break;
+            }
+            used += encoded_len;
+            emit(pending);
+            watermark = pending.seq;
+        }
+        watermark
+    }
+
+    /// Appends every deliverable queued Sixel emission newer than `after_seq`
+    /// to `out`, each wrapped in DECSC (`ESC 7`) + CUP to the client-mapped
+    /// absolute cell + the raw sequence + DECRC (`ESC 8`). `origin` is the
+    /// pane's top-left cell in the client frame (0-based). Bytes already in
+    /// `out` count against `budget`. See [`Self::fold_pending_sixels_after`]
+    /// for the queue and watermark discipline.
+    pub fn encode_pending_sixels_after(
+        &self,
+        after_seq: u64,
+        origin: (u16, u16),
+        budget: usize,
+        out: &mut Vec<u8>,
+    ) -> u64 {
+        let used = out.len();
+        self.fold_pending_sixels_after(after_seq, used, budget, |pending| {
+            let row = u32::from(origin.1) + u32::from(pending.row) + 1;
+            let col = u32::from(origin.0) + u32::from(pending.col) + 1;
+            out.extend_from_slice(b"\x1b7");
+            out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
+            out.extend_from_slice(&pending.data);
+            out.extend_from_slice(b"\x1b8");
+        })
+    }
+
+    /// Appends every deliverable queued Sixel emission newer than `after_seq`
+    /// to `out` as raw pane-local records for clients that position payloads
+    /// themselves (semantic-frame splices). `used` counts frame budget bytes
+    /// already claimed by other panes. See
+    /// [`Self::fold_pending_sixels_after`] for the queue and watermark
+    /// discipline.
+    pub fn collect_pending_sixels_after(
+        &self,
+        after_seq: u64,
+        used: usize,
+        budget: usize,
+        out: &mut Vec<PendingSixel>,
+    ) -> u64 {
+        self.fold_pending_sixels_after(after_seq, used, budget, |pending| {
+            out.push(pending.clone());
+        })
+    }
+
+    /// Returns true when the pane has queued OSC 5522 emissions newer than
+    /// `after_seq` that still need one-shot delivery.
+    pub fn has_pending_osc5522_after(&self, after_seq: u64) -> bool {
+        self.core
+            .lock()
+            .map(|core| {
+                core.osc5522_pending
+                    .back()
+                    .is_some_and(|pending| pending.seq > after_seq)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Sequence number of the newest queued OSC 5522 emission (0 when none
+    /// has ever been queued). Used to initialize a client's watermark so
+    /// newly attached clients never replay old emissions.
+    pub fn latest_osc5522_seq(&self) -> u64 {
+        self.core
+            .lock()
+            .map(|core| core.osc5522_next_seq.saturating_sub(1))
+            .unwrap_or(0)
+    }
+
+    /// Walks queued OSC 5522 emissions newer than `after_seq` under a
+    /// per-frame byte budget, calling `emit` for each deliverable one.
+    /// Same queue and watermark discipline as
+    /// [`Self::fold_pending_sixels_after`].
+    fn fold_pending_osc5522_after(
+        &self,
+        after_seq: u64,
+        mut used: usize,
+        budget: usize,
+        mut emit: impl FnMut(&PendingRawOsc),
+    ) -> u64 {
+        let Ok(core) = self.core.lock() else {
+            return after_seq;
+        };
+        let mut watermark = after_seq;
+        for pending in core.osc5522_pending.iter() {
+            if pending.seq <= after_seq {
+                continue;
+            }
+            // Payload plus slack for the splice record framing.
+            let encoded_len = pending.data.len() + 32;
+            if used.saturating_add(encoded_len) > budget {
+                if encoded_len > budget {
+                    // Never deliverable within any frame; drop it rather
+                    // than wedge delivery of everything behind it.
+                    debug!(
+                        seq = pending.seq,
+                        bytes = pending.data.len(),
+                        "dropping oversized pending OSC 5522 emission"
+                    );
+                    watermark = pending.seq;
+                    continue;
+                }
+                break;
+            }
+            used += encoded_len;
+            emit(pending);
+            watermark = pending.seq;
+        }
+        watermark
+    }
+
+    /// Appends every deliverable queued OSC 5522 emission newer than
+    /// `after_seq` to `out` verbatim (no positioning wrap; the sequence is
+    /// location-independent). Bytes already in `out` count against
+    /// `budget`. See [`Self::fold_pending_sixels_after`] for the queue and
+    /// watermark discipline.
+    pub fn encode_pending_osc5522_after(
+        &self,
+        after_seq: u64,
+        budget: usize,
+        out: &mut Vec<u8>,
+    ) -> u64 {
+        let used = out.len();
+        self.fold_pending_osc5522_after(after_seq, used, budget, |pending| {
+            out.extend_from_slice(&pending.data);
+        })
+    }
+
+    /// Appends every deliverable queued OSC 5522 emission newer than
+    /// `after_seq` to `out` as raw records for semantic-frame clients.
+    /// `used` counts frame budget bytes already claimed by other panes.
+    pub fn collect_pending_osc5522_after(
+        &self,
+        after_seq: u64,
+        used: usize,
+        budget: usize,
+        out: &mut Vec<PendingRawOsc>,
+    ) -> u64 {
+        self.fold_pending_osc5522_after(after_seq, used, budget, |pending| {
+            out.push(pending.clone());
+        })
     }
 
     pub fn seed_history_ansi(&self, ansi: &str) {
@@ -2262,6 +2586,64 @@ fn render_delay_after_pty_write(
         Some(CURSOR_POSITION_SETTLE)
     } else {
         None
+    }
+}
+
+/// Moves Sixel emissions surfaced by the terminal during the last write into
+/// the pane's bounded pending queue, assigning each a monotonic sequence.
+fn enqueue_pending_sixels(core: &mut GhosttyPaneCore) {
+    for emission in core.terminal.take_sixel_emissions() {
+        let seq = core.sixel_next_seq;
+        core.sixel_next_seq += 1;
+        core.sixel_pending.push_back(PendingSixel {
+            seq,
+            row: emission.row,
+            col: emission.col,
+            data: emission.data,
+        });
+    }
+
+    let total_bytes = |queue: &VecDeque<PendingSixel>| -> usize {
+        queue.iter().map(|pending| pending.data.len()).sum()
+    };
+    while core.sixel_pending.len() > SIXEL_PENDING_MAX_ENTRIES
+        || total_bytes(&core.sixel_pending) > SIXEL_PENDING_MAX_BYTES
+    {
+        let Some(dropped) = core.sixel_pending.pop_front() else {
+            break;
+        };
+        debug!(
+            seq = dropped.seq,
+            bytes = dropped.data.len(),
+            "dropped oldest pending sixel emission past queue bound"
+        );
+    }
+}
+
+/// Moves OSC 5522 emissions surfaced by the terminal during the last write
+/// into the pane's bounded pending queue, assigning each a monotonic
+/// sequence.
+fn enqueue_pending_osc5522(core: &mut GhosttyPaneCore) {
+    for data in core.terminal.take_osc5522_emissions() {
+        let seq = core.osc5522_next_seq;
+        core.osc5522_next_seq += 1;
+        core.osc5522_pending.push_back(PendingRawOsc { seq, data });
+    }
+
+    let total_bytes = |queue: &VecDeque<PendingRawOsc>| -> usize {
+        queue.iter().map(|pending| pending.data.len()).sum()
+    };
+    while core.osc5522_pending.len() > OSC5522_PENDING_MAX_ENTRIES
+        || total_bytes(&core.osc5522_pending) > OSC5522_PENDING_MAX_BYTES
+    {
+        let Some(dropped) = core.osc5522_pending.pop_front() else {
+            break;
+        };
+        debug!(
+            seq = dropped.seq,
+            bytes = dropped.data.len(),
+            "dropped oldest pending OSC 5522 emission past queue bound"
+        );
     }
 }
 

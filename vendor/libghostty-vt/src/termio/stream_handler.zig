@@ -363,6 +363,10 @@ pub const StreamHandler = struct {
             .apc_put => self.apc.feed(self.alloc, value),
             .apc_put_slice => self.apc.feedSlice(self.alloc, value.bytes),
 
+            // OSC 5522 passthrough is a libghostty-vt embedder feature; the
+            // Ghostty app does not forward the sequence anywhere.
+            .kitty_clipboard => {},
+
             // Unimplemented
             .title_push,
             .title_pop,
@@ -543,6 +547,11 @@ pub const StreamHandler = struct {
                 const msg = try termio.Message.writeReq(self.alloc, response[0..stream.pos]);
                 self.messageWriter(msg);
             },
+
+            // Sixel passthrough is a libghostty-vt embedder feature; the
+            // Ghostty app renders its own terminal and does not forward
+            // Sixel sequences anywhere. Memory is released by the caller.
+            .sixel => {},
         }
     }
 

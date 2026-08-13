@@ -778,7 +778,14 @@ fn client_read_loop(
             ClientMessage::Input { data } => {
                 // Validate input size.
                 if data.len() > MAX_INPUT_PAYLOAD {
-                    if crate::raw_input::is_complete_text_bracketed_paste(&data) {
+                    if crate::raw_input::is_complete_osc5522(&data)
+                        && data.len() <= crate::raw_input::OSC5522_MAX_SEQUENCE_BYTES
+                    {
+                        // A single complete enhanced-paste packet (e.g. an
+                        // image paste answering an OMP read request) may
+                        // legitimately exceed the interactive input limit.
+                        ServerEvent::ClientInput { client_id, data }
+                    } else if crate::raw_input::is_complete_text_bracketed_paste(&data) {
                         warn!(
                             client_id,
                             size = data.len(),

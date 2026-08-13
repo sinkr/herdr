@@ -269,6 +269,36 @@ impl App {
             }
             // Cell size reports are consumed by the thin client, not the runtime.
             crate::raw_input::RawInputEvent::HostCellSizeReport { .. } => false,
+            crate::raw_input::RawInputEvent::Osc5522(data) => {
+                // Enhanced-paste protocol packet from host stdin: forward
+                // the raw bytes to the focused terminal, bypassing
+                // key-event parsing. Popup pane first, then the focused
+                // pane in Terminal mode (same targets as Paste).
+                let runtime = if self.state.popup_pane.is_some() {
+                    self.popup_runtime()
+                } else if self.state.mode == super::Mode::Terminal {
+                    self.state.active.and_then(|ws_idx| {
+                        let focused = self
+                            .state
+                            .workspaces
+                            .get(ws_idx)
+                            .and_then(|ws| ws.focused_pane_id())?;
+                        self.state.runtime_for_pane_in_workspace(
+                            &self.terminal_runtimes,
+                            ws_idx,
+                            focused,
+                        )
+                    })
+                } else {
+                    None
+                };
+                if let Some(runtime) = runtime {
+                    let _ = runtime.try_send_bytes(bytes::Bytes::from(data));
+                } else {
+                    tracing::debug!("dropping OSC 5522 input with no focused terminal");
+                }
+                false
+            }
             crate::raw_input::RawInputEvent::Unsupported => false,
         };
         self.sync_prefix_input_source(previous_mode);

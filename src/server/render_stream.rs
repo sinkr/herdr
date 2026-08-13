@@ -6,7 +6,9 @@ use ratatui::layout::{Position, Rect, Size};
 use crate::app::state::AppState;
 use crate::app::Mode;
 use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit};
-use crate::protocol::{CursorState, FrameData, RenderEncoding, ServerMessage, TerminalFrame};
+use crate::protocol::{
+    CursorState, FrameData, RawOsc, RenderEncoding, ServerMessage, SixelSplice, TerminalFrame,
+};
 use crate::terminal::TerminalRuntimeRegistry;
 
 /// Per-client render baseline for the negotiated render encoding.
@@ -62,16 +64,48 @@ impl ClientRenderState {
         }
     }
 
+    pub(crate) fn is_terminal_ansi(&self) -> bool {
+        matches!(self, Self::TerminalAnsi { .. })
+    }
+
     pub(crate) fn prepare_frame(&mut self, frame: FrameData) -> Option<PreparedRender> {
+        self.prepare_frame_with_sixels(frame, &[], Vec::new(), &[], Vec::new())
+    }
+
+    /// Prepares a frame like [`Self::prepare_frame`], additionally carrying
+    /// one-shot passthrough emissions: pre-encoded ANSI bytes spliced into
+    /// TerminalAnsi output (`sixels` positioned, `osc_bytes` verbatim), or
+    /// records riding the semantic frame message (`splices` positioned,
+    /// `raw_osc` verbatim). Passthrough payloads are never stored in the
+    /// client baseline, so they are sent at most once even when the
+    /// surrounding frame is otherwise unchanged.
+    pub(crate) fn prepare_frame_with_sixels(
+        &mut self,
+        frame: FrameData,
+        sixels: &[u8],
+        splices: Vec<SixelSplice>,
+        osc_bytes: &[u8],
+        raw_osc: Vec<RawOsc>,
+    ) -> Option<PreparedRender> {
         match self {
             Self::Semantic { last_frame } => {
-                if last_frame.as_ref() == Some(&frame) {
+                if splices.is_empty() && raw_osc.is_empty() && last_frame.as_ref() == Some(&frame)
+                {
                     crate::render_prof::event("prepare_frame.semantic.skip_current");
                     return None;
                 }
                 crate::render_prof::event("prepare_frame.semantic.changed");
+                crate::render_prof::counter(
+                    "prepare_frame.sixel.splices",
+                    splices.len() as u64,
+                );
+                crate::render_prof::counter("prepare_frame.raw_osc.records", raw_osc.len() as u64);
                 Some(PreparedRender::Semantic {
-                    message: ServerMessage::Frame(frame),
+                    message: ServerMessage::Frame {
+                        frame,
+                        sixels: splices,
+                        raw_osc,
+                    },
                 })
             }
             Self::TerminalAnsi {
@@ -79,7 +113,15 @@ impl ClientRenderState {
                 seq,
                 repaint_pending,
             } => {
-                if !*repaint_pending && blit_encoder.is_current(&frame) {
+                debug_assert!(
+                    splices.is_empty() && raw_osc.is_empty(),
+                    "semantic passthrough records offered to a TerminalAnsi client"
+                );
+                if sixels.is_empty()
+                    && osc_bytes.is_empty()
+                    && !*repaint_pending
+                    && blit_encoder.is_current(&frame)
+                {
                     crate::render_prof::event("prepare_frame.ansi.skip_current");
                     return None;
                 }
@@ -92,6 +134,10 @@ impl ClientRenderState {
                     crate::render_prof::event("prepare_frame.ansi.partial");
                 }
                 insert_graphics_before_sync_end(&mut encoded.bytes, &frame.graphics);
+                insert_graphics_before_sync_end(&mut encoded.bytes, sixels);
+                insert_graphics_before_sync_end(&mut encoded.bytes, osc_bytes);
+                crate::render_prof::counter("prepare_frame.sixel.bytes", sixels.len() as u64);
+                crate::render_prof::counter("prepare_frame.raw_osc.bytes", osc_bytes.len() as u64);
                 crate::render_prof::counter(
                     "prepare_frame.graphics.bytes",
                     frame.graphics.len() as u64,
@@ -123,7 +169,8 @@ impl ClientRenderState {
             (
                 Self::Semantic { last_frame },
                 PreparedRender::Semantic {
-                    message: ServerMessage::Frame(frame),
+                    // Sixels are one-shot: only the frame enters the baseline.
+                    message: ServerMessage::Frame { frame, .. },
                 },
             ) => *last_frame = Some(frame),
             (
@@ -189,7 +236,7 @@ impl PreparedRender {
     pub(crate) fn into_frame(self) -> Option<FrameData> {
         match self {
             Self::Semantic {
-                message: ServerMessage::Frame(frame),
+                message: ServerMessage::Frame { frame, .. },
             } => Some(frame),
             Self::TerminalAnsi { frame, .. } => Some(frame),
             _ => None,
@@ -466,6 +513,202 @@ fn focused_terminal_suppresses_host_cursor(
     app_state
         .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
         .is_some_and(crate::terminal::TerminalRuntime::synchronized_output_active)
+}
+
+#[cfg(test)]
+mod sixel_passthrough_tests {
+    use super::*;
+    use crate::protocol::RenderEncoding;
+    use crate::terminal::TerminalRuntime;
+
+    const SIXEL: &[u8] = b"\x1bP0;0;8q\"1;1;4;4#0;2;0;0;0#0!4~-!4~\x1b\\";
+    const SIXEL_FRAME_BUDGET: usize = 9 * 1024 * 1024;
+
+    fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return 0;
+        }
+        haystack
+            .windows(needle.len())
+            .filter(|window| *window == needle)
+            .count()
+    }
+
+    fn client_frame(runtime: &TerminalRuntime, area: Rect) -> FrameData {
+        let (buffer, cursor) = render_terminal_virtual(runtime, area);
+        FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &[])
+    }
+
+    fn terminal_frame_bytes(prepared: &PreparedRender) -> Vec<u8> {
+        match prepared.message() {
+            ServerMessage::Terminal(frame) => frame.bytes.clone(),
+            other => panic!("expected terminal frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sixel_passthrough_delivered_once_to_terminal_ansi_client() {
+        let (runtime, _rx) = TerminalRuntime::test_with_channel(80, 24);
+        let area = Rect::new(0, 0, 80, 24);
+        let mut render_state = ClientRenderState::new(RenderEncoding::TerminalAnsi);
+
+        // Client attached while the pane had no emissions: watermark is the
+        // pane's newest sequence (0), mirroring headless lazy initialization.
+        let mut watermark = runtime.latest_sixel_seq();
+        assert_eq!(watermark, 0);
+
+        let mut pty_bytes = b"hello".to_vec();
+        pty_bytes.extend_from_slice(SIXEL);
+        pty_bytes.extend_from_slice(b"world");
+        runtime.test_process_pty_bytes(&pty_bytes);
+
+        // First frame: the sixel DCS is spliced exactly once, wrapped in
+        // DECSC + CUP (cursor was after "hello": row 1, col 6) + DECRC.
+        let mut sixel_bytes = Vec::new();
+        let advanced = runtime.encode_pending_sixels_after(
+            watermark,
+            (0, 0),
+            SIXEL_FRAME_BUDGET,
+            &mut sixel_bytes,
+        );
+        assert_eq!(advanced, 1);
+        let prepared = render_state
+            .prepare_frame_with_sixels(
+                client_frame(&runtime, area),
+                &sixel_bytes,
+                Vec::new(),
+                &[],
+                Vec::new(),
+            )
+            .expect("first frame must encode");
+        let client_bytes = terminal_frame_bytes(&prepared);
+        assert_eq!(count_occurrences(&client_bytes, SIXEL), 1);
+        let mut wrapped = b"\x1b7\x1b[1;6H".to_vec();
+        wrapped.extend_from_slice(SIXEL);
+        wrapped.extend_from_slice(b"\x1b8");
+        assert_eq!(count_occurrences(&client_bytes, &wrapped), 1);
+        render_state.commit_sent_frame(prepared);
+        watermark = advanced;
+
+        // The DCS payload must not have corrupted the text grid.
+        let text_row: String = client_frame(&runtime, area).cells[..10]
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert_eq!(text_row, "helloworld");
+
+        // Second frame (new text, no new emission): zero sixel bytes.
+        runtime.test_process_pty_bytes(b" again");
+        let mut sixel_bytes = Vec::new();
+        let advanced = runtime.encode_pending_sixels_after(
+            watermark,
+            (0, 0),
+            SIXEL_FRAME_BUDGET,
+            &mut sixel_bytes,
+        );
+        assert_eq!(advanced, watermark);
+        assert!(sixel_bytes.is_empty());
+        let prepared = render_state
+            .prepare_frame_with_sixels(
+                client_frame(&runtime, area),
+                &sixel_bytes,
+                Vec::new(),
+                &[],
+                Vec::new(),
+            )
+            .expect("changed text must encode a second frame");
+        let client_bytes = terminal_frame_bytes(&prepared);
+        assert_eq!(count_occurrences(&client_bytes, b"\x1bP"), 0);
+        render_state.commit_sent_frame(prepared);
+
+        // An unchanged frame with no pending sixels is skipped entirely.
+        assert!(render_state
+            .prepare_frame_with_sixels(
+                client_frame(&runtime, area),
+                &[],
+                Vec::new(),
+                &[],
+                Vec::new()
+            )
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn osc5522_passthrough_delivered_once_to_terminal_ansi_client() {
+        const OSC: &[u8] = b"\x1b]5522;type=read:pw=abc\x07";
+        const OSC_FRAME_BUDGET: usize = 4 * 1024 * 1024;
+
+        let (runtime, _rx) = TerminalRuntime::test_with_channel(80, 24);
+        let area = Rect::new(0, 0, 80, 24);
+        let mut render_state = ClientRenderState::new(RenderEncoding::TerminalAnsi);
+
+        let mut watermark = runtime.latest_osc5522_seq();
+        assert_eq!(watermark, 0);
+
+        let mut pty_bytes = b"hello".to_vec();
+        pty_bytes.extend_from_slice(OSC);
+        pty_bytes.extend_from_slice(b"world");
+        runtime.test_process_pty_bytes(&pty_bytes);
+
+        // First frame: the OSC is spliced exactly once, verbatim, with no
+        // positioning wrap.
+        let mut osc_bytes = Vec::new();
+        let advanced =
+            runtime.encode_pending_osc5522_after(watermark, OSC_FRAME_BUDGET, &mut osc_bytes);
+        assert_eq!(advanced, 1);
+        assert_eq!(osc_bytes, OSC);
+        let prepared = render_state
+            .prepare_frame_with_sixels(
+                client_frame(&runtime, area),
+                &[],
+                Vec::new(),
+                &osc_bytes,
+                Vec::new(),
+            )
+            .expect("first frame must encode");
+        let client_bytes = terminal_frame_bytes(&prepared);
+        assert_eq!(count_occurrences(&client_bytes, OSC), 1);
+        render_state.commit_sent_frame(prepared);
+        watermark = advanced;
+
+        // The OSC payload must not have corrupted the text grid.
+        let text_row: String = client_frame(&runtime, area).cells[..10]
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert_eq!(text_row, "helloworld");
+
+        // Second frame (new text, no new emission): zero OSC bytes.
+        runtime.test_process_pty_bytes(b" again");
+        let mut osc_bytes = Vec::new();
+        let advanced =
+            runtime.encode_pending_osc5522_after(watermark, OSC_FRAME_BUDGET, &mut osc_bytes);
+        assert_eq!(advanced, watermark);
+        assert!(osc_bytes.is_empty());
+        let prepared = render_state
+            .prepare_frame_with_sixels(
+                client_frame(&runtime, area),
+                &[],
+                Vec::new(),
+                &osc_bytes,
+                Vec::new(),
+            )
+            .expect("changed text must encode a second frame");
+        let client_bytes = terminal_frame_bytes(&prepared);
+        assert_eq!(count_occurrences(&client_bytes, b"\x1b]5522"), 0);
+        render_state.commit_sent_frame(prepared);
+
+        // An unchanged frame with no pending emissions is skipped entirely.
+        assert!(render_state
+            .prepare_frame_with_sixels(
+                client_frame(&runtime, area),
+                &[],
+                Vec::new(),
+                &[],
+                Vec::new()
+            )
+            .is_none());
+    }
 }
 
 #[cfg(test)]

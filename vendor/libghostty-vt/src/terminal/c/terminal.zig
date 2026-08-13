@@ -74,6 +74,8 @@ const Effects = struct {
     pwd_changed: ?PwdChangedFn = null,
     size_cb: ?SizeFn = null,
     clipboard_write: ?ClipboardWriteFn = null,
+    sixel: ?SixelFn = null,
+    osc5522: ?Osc5522Fn = null,
 
     /// Scratch buffer for DA1 feature codes. The device attributes
     /// trampoline converts C feature codes into this buffer and returns
@@ -118,6 +120,18 @@ const Effects = struct {
     /// Returns true and fills out_size if size is available,
     /// or returns false to silently ignore the query.
     pub const SizeFn = *const fn (Terminal, ?*anyopaque, *size_report.Size) callconv(lib.calling_conv) bool;
+
+    /// C function pointer type for the sixel callback. The data is the
+    /// complete re-synthesized Sixel DCS sequence and is only valid for
+    /// the duration of the call. Row/col are the 0-based cursor cell in
+    /// the active screen area captured when the sequence started.
+    pub const SixelFn = *const fn (Terminal, ?*anyopaque, [*]const u8, usize, u16, u16) callconv(lib.calling_conv) void;
+
+    /// C function pointer type for the osc5522 callback. The data is the
+    /// complete re-synthesized OSC 5522 sequence
+    /// (`ESC ] 5522 ; <body> <terminator>`) and is only valid for the
+    /// duration of the call.
+    pub const Osc5522Fn = *const fn (Terminal, ?*anyopaque, [*]const u8, usize) callconv(lib.calling_conv) void;
 
     /// C function pointer type for the device_attributes callback.
     /// Returns true and fills out_attrs if attributes are available,
@@ -280,6 +294,25 @@ const Effects = struct {
         if (func(@ptrCast(wrapper), wrapper.effects.userdata, &s)) return s;
         return null;
     }
+
+    fn sixelTrampoline(
+        handler: *Handler,
+        data: []const u8,
+        row: size.CellCountInt,
+        col: size.CellCountInt,
+    ) void {
+        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
+        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const func = wrapper.effects.sixel orelse return;
+        func(@ptrCast(wrapper), wrapper.effects.userdata, data.ptr, data.len, row, col);
+    }
+
+    fn osc5522Trampoline(handler: *Handler, data: []const u8) void {
+        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
+        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const func = wrapper.effects.osc5522 orelse return;
+        func(@ptrCast(wrapper), wrapper.effects.userdata, data.ptr, data.len);
+    }
 };
 
 /// C: GhosttyTerminal
@@ -365,6 +398,8 @@ fn new_(
         .title_changed = &Effects.titleChangedTrampoline,
         .pwd_changed = &Effects.pwdChangedTrampoline,
         .size = &Effects.sizeTrampoline,
+        .sixel = &Effects.sixelTrampoline,
+        .osc5522 = &Effects.osc5522Trampoline,
         .clipboard_write = &Effects.clipboardWriteTrampoline,
     };
 
@@ -438,6 +473,8 @@ pub const Option = enum(c_int) {
     glyph_protocol = 24,
     pwd_changed = 25,
     clipboard_write = 26,
+    sixel = 27,
+    osc5522 = 28,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -453,6 +490,8 @@ pub const Option = enum(c_int) {
             .pwd_changed => ?Effects.PwdChangedFn,
             .size_cb => ?Effects.SizeFn,
             .clipboard_write => ?Effects.ClipboardWriteFn,
+            .sixel => ?Effects.SixelFn,
+            .osc5522 => ?Effects.Osc5522Fn,
             .title, .pwd => ?*const lib.String,
             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
             .color_palette => ?*const color.PaletteC,
@@ -510,6 +549,8 @@ fn setTyped(
         .pwd_changed => wrapper.effects.pwd_changed = value,
         .size_cb => wrapper.effects.size_cb = value,
         .clipboard_write => wrapper.effects.clipboard_write = value,
+        .sixel => wrapper.effects.sixel = value,
+        .osc5522 => wrapper.effects.osc5522 = value,
         .title => {
             const str = if (value) |v| v.ptr[0..v.len] else "";
             wrapper.terminal.setTitle(str) catch return .out_of_memory;

@@ -22,6 +22,13 @@ pub const OSC = struct {
     /// The terminator that was used in case we need to send a response.
     terminator: Terminator,
 
+    /// We don't currently support encoding this to C in any way.
+    pub const C = void;
+
+    pub fn cval(_: OSC) C {
+        return {};
+    }
+
     /// Decode an option from the metadata.
     pub fn readOption(self: OSC, comptime key: Option) ?key.Type() {
         return key.read(self.metadata);

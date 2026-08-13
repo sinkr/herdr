@@ -4,8 +4,10 @@ const testing = std.testing;
 const apc = @import("apc.zig");
 const clipboard = @import("clipboard.zig");
 const csi = @import("csi.zig");
+const dcs = @import("dcs.zig");
 const device_attributes = @import("device_attributes.zig");
 const device_status = @import("device_status.zig");
+const Parser = @import("Parser.zig");
 const stream = @import("stream.zig");
 const Action = stream.Action;
 const Screen = @import("Screen.zig");
@@ -14,6 +16,7 @@ const modes = @import("modes.zig");
 const osc = @import("osc.zig");
 const osc_color = @import("osc/parsers/color.zig");
 const kitty_color = @import("kitty/color.zig");
+const size = @import("size.zig");
 const size_report = @import("size_report.zig");
 const Terminal = @import("Terminal.zig");
 
@@ -45,6 +48,18 @@ pub const Handler = struct {
     /// to send commands to the terminal emulator. This is used by
     /// the kitty graphics protocol.
     apc_handler: apc.Handler = .{},
+
+    /// The DCS command handler maintains DCS state. Used for Sixel
+    /// passthrough; other DCS commands (XTGETTCAP, DECRQSS, tmux) are
+    /// parsed but their commands are ignored because this handler has
+    /// no way to respond to them differently than before (silence).
+    dcs_handler: dcs.Handler = .{},
+
+    /// Cursor position captured at DCS hook time, so a completed Sixel
+    /// sequence can report where the image was emitted. 0-based cells
+    /// in the active screen area.
+    sixel_hook_x: size.CellCountInt = 0,
+    sixel_hook_y: size.CellCountInt = 0,
 
     /// Default cursor style used by DECSCUSR reset (CSI 0 q).
     default_cursor: bool = true,
@@ -111,6 +126,27 @@ pub const Handler = struct {
         /// is 256 bytes; longer strings will be silently ignored.
         xtversion: ?*const fn (*Handler) []const u8,
 
+        /// Called when a complete Sixel DCS sequence has been received.
+        /// The data is the full re-synthesized sequence
+        /// (`ESC P <params> q <payload> ESC \`) and is only valid for the
+        /// duration of the call. The row/col are the 0-based cursor cell
+        /// in the active screen area captured when the sequence started.
+        ///
+        /// The terminal does NOT decode or store Sixel data; this effect
+        /// exists so embedders can pass the sequence through to an
+        /// attached sixel-capable terminal.
+        sixel: ?*const fn (*Handler, data: []const u8, row: size.CellCountInt, col: size.CellCountInt) void,
+
+        /// Called when a complete OSC 5522 (kitty clipboard protocol /
+        /// enhanced paste) sequence has been received. The data is the
+        /// full re-synthesized sequence (`ESC ] 5522 ; <body> <terminator>`)
+        /// and is only valid for the duration of the call.
+        ///
+        /// The terminal does NOT act on the command; this effect exists so
+        /// embedders can pass the sequence through to an attached client
+        /// that implements the protocol.
+        osc5522: ?*const fn (*Handler, data: []const u8) void,
+
         /// No effects means that the stream effectively becomes readonly
         /// that only affects pure terminal state and ignores all side
         /// effects beyond that.
@@ -121,6 +157,8 @@ pub const Handler = struct {
             .device_attributes = null,
             .enquiry = null,
             .size = null,
+            .sixel = null,
+            .osc5522 = null,
             .title_changed = null,
             .pwd_changed = null,
             .write_pty = null,
@@ -136,6 +174,7 @@ pub const Handler = struct {
 
     pub fn deinit(self: *Handler) void {
         self.apc_handler.deinit();
+        self.dcs_handler.deinit();
     }
 
     pub fn vt(
@@ -297,13 +336,16 @@ pub const Handler = struct {
             .report_pwd => self.reportPwd(value.url),
             .xtversion => self.reportXtversion(),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
+            .kitty_clipboard => try self.oscKittyClipboard(value),
 
-            // No supported DCS commands have any terminal-modifying effects,
-            // but they may in the future. For now we just ignore it.
-            .dcs_hook,
-            .dcs_put,
-            .dcs_unhook,
-            => {},
+            // DCS. No supported DCS command modifies terminal state; the
+            // handler exists so completed Sixel sequences can be surfaced
+            // through the sixel effect. All other parsed DCS commands
+            // (XTGETTCAP, DECRQSS, tmux) are dropped, matching the previous
+            // behavior of ignoring them entirely.
+            .dcs_hook => self.dcsHook(value),
+            .dcs_put => self.dcsPut(value),
+            .dcs_unhook => self.dcsUnhook(),
 
             // Have no terminal-modifying effect
             .show_desktop_notification,
@@ -317,6 +359,68 @@ pub const Handler = struct {
     inline fn writePty(self: *Handler, data: [:0]const u8) void {
         const func = self.effects.write_pty orelse return;
         func(self, data);
+    }
+
+    /// OSC 5522 (kitty clipboard protocol / enhanced paste) passthrough.
+    /// The terminal does not implement the protocol; the full sequence is
+    /// re-synthesized verbatim (`ESC ] 5522 ; <body> <terminator>`) and
+    /// surfaced through the osc5522 effect so embedders can forward it to
+    /// an attached client that does.
+    fn oscKittyClipboard(self: *Handler, v: Action.KittyClipboard) !void {
+        const func = self.effects.osc5522 orelse return;
+
+        var aw: std.Io.Writer.Allocating = try .initCapacity(
+            self.terminal.gpa(),
+            "\x1b]5522;".len + v.metadata.len +
+                (if (v.payload) |p| p.len + 1 else 0) + 2,
+        );
+        defer aw.deinit();
+        try aw.writer.writeAll("\x1b]5522;");
+        try aw.writer.writeAll(v.metadata);
+        if (v.payload) |payload| {
+            try aw.writer.writeByte(';');
+            try aw.writer.writeAll(payload);
+        }
+        try aw.writer.writeAll(v.terminator.string());
+        func(self, aw.written());
+    }
+
+    fn dcsHook(self: *Handler, value: Parser.Action.DCS) void {
+        // Capture the cursor position at hook time so a completed Sixel
+        // sequence reports where the image was emitted.
+        self.sixel_hook_x = self.terminal.screens.active.cursor.x;
+        self.sixel_hook_y = self.terminal.screens.active.cursor.y;
+        var cmd = self.dcs_handler.hook(self.terminal.gpa(), value) orelse return;
+        defer cmd.deinit();
+        self.dcsCommand(&cmd);
+    }
+
+    fn dcsPut(self: *Handler, byte: u8) void {
+        var cmd = self.dcs_handler.put(byte) orelse return;
+        defer cmd.deinit();
+        self.dcsCommand(&cmd);
+    }
+
+    fn dcsUnhook(self: *Handler) void {
+        var cmd = self.dcs_handler.unhook() orelse return;
+        defer cmd.deinit();
+        self.dcsCommand(&cmd);
+    }
+
+    fn dcsCommand(self: *Handler, cmd: *dcs.Command) void {
+        switch (cmd.*) {
+            .sixel => |*sixel| {
+                const func = self.effects.sixel orelse return;
+                func(self, sixel.bytes(), self.sixel_hook_y, self.sixel_hook_x);
+            },
+
+            // Parsed but unsupported here; dropping them keeps the previous
+            // (silent) behavior. Memory is released by the caller's deinit.
+            .xtgettcap,
+            .decrqss,
+            .tmux,
+            => {},
+        }
     }
 
     fn bell(self: *Handler) void {
@@ -2625,4 +2729,108 @@ test "kitty graphics via APC" {
     const storage = &t.screens.active.kitty_images;
     const img = storage.imageById(1).?;
     try testing.expectEqual(.rgb, img.format);
+}
+
+test "osc5522 effect surfaces full sequence once with BEL terminator" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var calls: usize = 0;
+        var captured: ?[]const u8 = null;
+        fn osc5522(_: *Handler, data: []const u8) void {
+            calls += 1;
+            if (captured) |old| testing.allocator.free(old);
+            captured = testing.allocator.dupe(u8, data) catch @panic("OOM");
+        }
+    };
+    S.calls = 0;
+    S.captured = null;
+    defer if (S.captured) |old| testing.allocator.free(old);
+
+    var handler: Handler = .init(&t);
+    handler.effects.osc5522 = &S.osc5522;
+
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    // Metadata plus payload; the payload may itself contain ';'.
+    s.nextSlice("before\x1b]5522;type=write:mime=dGV4dA==;aGVsbG87d28=\x07after");
+    try testing.expectEqual(@as(usize, 1), S.calls);
+    try testing.expectEqualStrings(
+        "\x1b]5522;type=write:mime=dGV4dA==;aGVsbG87d28=\x07",
+        S.captured.?,
+    );
+
+    // Surrounding text still prints normally.
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("beforeafter", str);
+}
+
+test "osc5522 effect surfaces full sequence with ST terminator" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var calls: usize = 0;
+        var captured: ?[]const u8 = null;
+        fn osc5522(_: *Handler, data: []const u8) void {
+            calls += 1;
+            if (captured) |old| testing.allocator.free(old);
+            captured = testing.allocator.dupe(u8, data) catch @panic("OOM");
+        }
+    };
+    S.calls = 0;
+    S.captured = null;
+    defer if (S.captured) |old| testing.allocator.free(old);
+
+    var handler: Handler = .init(&t);
+    handler.effects.osc5522 = &S.osc5522;
+
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    // Metadata only (a read request), split across writes.
+    s.nextSlice("\x1b]5522;type=re");
+    try testing.expectEqual(@as(usize, 0), S.calls);
+    s.nextSlice("ad:pw=abc\x1b\\");
+    try testing.expectEqual(@as(usize, 1), S.calls);
+    try testing.expectEqualStrings("\x1b]5522;type=read:pw=abc\x1b\\", S.captured.?);
+}
+
+test "osc5522 over-cap sequence is dropped entirely" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var calls: usize = 0;
+        fn osc5522(_: *Handler, _: []const u8) void {
+            calls += 1;
+        }
+    };
+    S.calls = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.osc5522 = &S.osc5522;
+
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+    s.parser.osc_parser.max_bytes_5522 = 32;
+
+    s.nextSlice("\x1b]5522;type=write;");
+    for (0..64) |_| s.next('A');
+    s.nextSlice("\x07after");
+
+    // Dropped entirely: never surfaced, not even truncated.
+    try testing.expectEqual(@as(usize, 0), S.calls);
+
+    // The terminal keeps working after the dropped sequence.
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("after", str);
+
+    // A follow-up in-cap sequence is surfaced normally.
+    s.nextSlice("\x1b]5522;type=read\x1b\\");
+    try testing.expectEqual(@as(usize, 1), S.calls);
 }

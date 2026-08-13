@@ -1881,6 +1881,36 @@ impl App {
                     }
                 }
                 crate::raw_input::RawInputEvent::HostCellSizeReport { .. } => {}
+                crate::raw_input::RawInputEvent::Osc5522(data) => {
+                    // Enhanced-paste protocol packet from a client (e.g. the
+                    // web bridge answering an OMP read request): forward the
+                    // raw bytes to the focused terminal, bypassing key-event
+                    // parsing. Mirrors the Paste target selection: popup
+                    // pane first, then the focused pane in Terminal mode.
+                    let runtime = if self.state.popup_pane.is_some() {
+                        self.popup_runtime()
+                    } else if self.state.mode == Mode::Terminal {
+                        self.state.active.and_then(|ws_idx| {
+                            let focused = self
+                                .state
+                                .workspaces
+                                .get(ws_idx)
+                                .and_then(|ws| ws.focused_pane_id())?;
+                            self.state.runtime_for_pane_in_workspace(
+                                &self.terminal_runtimes,
+                                ws_idx,
+                                focused,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(runtime) = runtime {
+                        let _ = runtime.try_send_bytes(bytes::Bytes::from(data));
+                    } else {
+                        tracing::debug!("dropping OSC 5522 input with no focused terminal");
+                    }
+                }
                 crate::raw_input::RawInputEvent::Unsupported => {}
             }
             self.sync_prefix_input_source(previous_mode);

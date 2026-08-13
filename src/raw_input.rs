@@ -107,6 +107,14 @@ pub(crate) const GHOSTTY_COLOR_SCHEME_DARK_REPORT: &[u8] = b"\x1b[?997;1n";
 pub(crate) const GHOSTTY_COLOR_SCHEME_LIGHT_REPORT: &[u8] = b"\x1b[?997;2n";
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+/// Introducer of an OSC 5522 (kitty clipboard protocol / enhanced paste)
+/// sequence. Bytes between this and the OSC terminator (BEL or ST) are
+/// forwarded to the focused pane verbatim, bypassing key-event parsing.
+const OSC5522_INTRO: &[u8] = b"\x1b]5522;";
+/// Largest OSC 5522 sequence accepted from client stdin. Sequences that
+/// exceed the cap are dropped entirely (never forwarded truncated).
+/// Matches the pane-side cap in vendor .../terminal/osc.zig.
+pub(crate) const OSC5522_MAX_SEQUENCE_BYTES: usize = 20 * 1024 * 1024;
 
 /// Returns the UTF-8 payload when `data` is exactly one complete bracketed paste.
 pub(crate) fn complete_text_bracketed_paste(data: &[u8]) -> Option<&str> {
@@ -124,6 +132,19 @@ pub(crate) fn complete_text_bracketed_paste(data: &[u8]) -> Option<&str> {
 /// pastes from generic oversized input, which remains a protocol violation.
 pub(crate) fn is_complete_text_bracketed_paste(data: &[u8]) -> bool {
     complete_text_bracketed_paste(data).is_some()
+}
+
+/// Returns whether `data` is exactly one complete OSC 5522 sequence
+/// (`ESC ] 5522 ; ... BEL|ST`).
+///
+/// Client transport uses this to let enhanced-paste packets exceed the
+/// ordinary interactive-input size limit without opening the door to
+/// arbitrary oversized input.
+pub(crate) fn is_complete_osc5522(data: &[u8]) -> bool {
+    if !data.starts_with(OSC5522_INTRO) {
+        return false;
+    }
+    osc_string_terminator(data) == Some(data.len())
 }
 
 #[derive(Debug)]
@@ -149,6 +170,9 @@ pub enum RawInputEvent {
         height_px: u32,
     },
     Unsupported,
+    /// A complete OSC 5522 (enhanced paste) sequence to forward to the
+    /// focused pane verbatim.
+    Osc5522(Vec<u8>),
 }
 
 #[derive(Default)]
@@ -229,6 +253,27 @@ pub(crate) struct RawInputByteFramer {
     host_color_scheme_change_tracking: bool,
     host_appearance_query_on_focus: bool,
     split_coalesced_escape: bool,
+    /// Active OSC 5522 accumulation. While set, every stdin byte belongs
+    /// to the sequence until its BEL/ST terminator arrives.
+    osc5522: Option<Osc5522Accumulator>,
+}
+
+/// Stateful accumulator for an OSC 5522 sequence split across reads.
+///
+/// The sequence bytes (including the introducer) collect in `data` until
+/// the OSC terminator arrives. Past [`OSC5522_MAX_SEQUENCE_BYTES`] the
+/// whole sequence is dropped: `data` is released, and the remaining bytes
+/// are consumed (tracking only ST continuity) until the terminator.
+#[derive(Default)]
+struct Osc5522Accumulator {
+    data: Vec<u8>,
+    /// Total sequence bytes seen, including discarded ones.
+    total: usize,
+    /// The sequence exceeded the cap and is being discarded.
+    overflowed: bool,
+    /// Whether the last consumed byte was ESC (for split `ESC \`
+    /// terminator detection across reads).
+    trailing_esc: bool,
 }
 
 const HOST_COLOR_QUERY_REPLIES: u16 = 258;
@@ -293,7 +338,7 @@ impl RawInputByteFramer {
     }
 
     pub(crate) fn has_pending_input(&self) -> bool {
-        !self.buffer.is_empty()
+        !self.buffer.is_empty() || self.osc5522.is_some()
     }
 
     #[cfg(any(not(windows), test))]
@@ -438,6 +483,21 @@ impl RawInputByteFramer {
             return chunks;
         }
 
+        // A strict prefix of the OSC 5522 introducer may still become an
+        // enhanced-paste packet whose continuation is in flight; keep
+        // waiting instead of discarding it as an incomplete control string.
+        // Bounded: at most the 7 introducer bytes are ever held.
+        if self.buffer.len() >= 2
+            && self.buffer.len() < OSC5522_INTRO.len()
+            && OSC5522_INTRO.starts_with(&self.buffer)
+        {
+            tracing::trace!(
+                len = self.buffer.len(),
+                "holding possible OSC 5522 introducer prefix"
+            );
+            return chunks;
+        }
+
         if let Some(ControlString::Incomplete { family }) = control_string(&self.buffer) {
             tracing::debug!(
                 len = self.buffer.len(),
@@ -499,6 +559,15 @@ impl RawInputByteFramer {
         let mut chunks = Vec::new();
 
         loop {
+            // An active OSC 5522 accumulation owns every byte until its
+            // terminator arrives; nothing else may interpret the stream.
+            if self.osc5522.is_some() {
+                if self.pump_osc5522(&mut chunks) {
+                    continue;
+                }
+                break;
+            }
+
             if self.lone_escape_recently_flushed {
                 if starts_with_incomplete_orphaned_sgr_mouse_tail(&self.buffer) {
                     break;
@@ -549,6 +618,14 @@ impl RawInputByteFramer {
                 continue;
             }
 
+            // The start of an OSC 5522 sequence: switch to stateful
+            // accumulation so multi-megabyte enhanced-paste packets are
+            // neither rescanned per read nor discarded on idle flushes.
+            if self.buffer.starts_with(OSC5522_INTRO) {
+                self.osc5522 = Some(Osc5522Accumulator::default());
+                continue;
+            }
+
             let Some((event, consumed)) = extract_one_event(&self.buffer) else {
                 break;
             };
@@ -576,6 +653,75 @@ impl RawInputByteFramer {
         }
 
         chunks
+    }
+
+    /// Feeds buffered bytes into the active OSC 5522 accumulation, scanning
+    /// only the new bytes for the terminator (BEL, or ST split across
+    /// reads). On completion the full sequence is emitted as one chunk —
+    /// unless it overflowed the cap, in which case it is dropped entirely —
+    /// and any bytes after the terminator stay buffered for normal parsing.
+    ///
+    /// Returns true when the accumulation completed (the caller should keep
+    /// draining), false when more input is needed.
+    fn pump_osc5522(&mut self, chunks: &mut Vec<Vec<u8>>) -> bool {
+        let Some(acc) = self.osc5522.as_mut() else {
+            return false;
+        };
+
+        let mut prev_esc = acc.trailing_esc;
+        let mut end = None;
+        for (idx, &byte) in self.buffer.iter().enumerate() {
+            if byte == 0x07 || (prev_esc && byte == b'\\') {
+                end = Some(idx + 1);
+                break;
+            }
+            prev_esc = byte == ESC;
+        }
+
+        let Some(end) = end else {
+            // No terminator yet: absorb everything and wait for more.
+            let incoming = std::mem::take(&mut self.buffer);
+            if let Some(&last) = incoming.last() {
+                acc.trailing_esc = last == ESC;
+            }
+            acc.total += incoming.len();
+            if !acc.overflowed {
+                if acc.data.len() + incoming.len() > OSC5522_MAX_SEQUENCE_BYTES {
+                    tracing::warn!(
+                        bytes = acc.data.len() + incoming.len(),
+                        max = OSC5522_MAX_SEQUENCE_BYTES,
+                        "dropping oversized OSC 5522 input sequence"
+                    );
+                    acc.overflowed = true;
+                    acc.data = Vec::new();
+                } else {
+                    acc.data.extend_from_slice(&incoming);
+                }
+            }
+            return false;
+        };
+
+        let rest = self.buffer.split_off(end);
+        let seq_tail = std::mem::replace(&mut self.buffer, rest);
+        acc.total += seq_tail.len();
+        let dropped =
+            acc.overflowed || acc.data.len() + seq_tail.len() > OSC5522_MAX_SEQUENCE_BYTES;
+        if dropped {
+            if !acc.overflowed {
+                tracing::warn!(
+                    bytes = acc.total,
+                    max = OSC5522_MAX_SEQUENCE_BYTES,
+                    "dropping oversized OSC 5522 input sequence"
+                );
+            }
+            tracing::debug!(bytes = acc.total, "discarded oversized OSC 5522 sequence");
+        } else {
+            let mut data = std::mem::take(&mut acc.data);
+            data.extend_from_slice(&seq_tail);
+            chunks.push(data);
+        }
+        self.osc5522 = None;
+        true
     }
 }
 
@@ -833,6 +979,15 @@ fn extract_one_event(buffer: &[u8]) -> Option<(RawInputEvent, usize)> {
             RawInputEvent::Paste(content.to_string()),
             end + BRACKETED_PASTE_END.len(),
         ));
+    }
+
+    // A complete OSC 5522 sequence becomes one pane-input event carrying
+    // the full bytes verbatim; key-event parsing never sees it. Incomplete
+    // sequences wait for more input (the byte framer accumulates them
+    // statefully instead of re-scanning through this path).
+    if buffer.starts_with(OSC5522_INTRO) {
+        let len = osc_string_terminator(buffer)?;
+        return Some((RawInputEvent::Osc5522(buffer[..len].to_vec()), len));
     }
 
     if buffer[0] == ESC {
@@ -3114,5 +3269,85 @@ mod tests {
         // Window closed: a later lone Escape flushes immediately.
         assert!(framer.push(b"\x1b").is_empty());
         assert_eq!(framer.flush_timeout(), vec![b"\x1b".to_vec()]);
+    }
+
+    #[test]
+    fn osc5522_split_across_reads_yields_one_pane_input_blob_between_keys() {
+        let mut framer = RawInputFramer::default();
+
+        // "ls\r" plus the start of a 5522 OSC in the first read.
+        let mut events = framer.push(b"ls\r\x1b]5522;type=paste-event:si");
+        // The OSC continuation plus a trailing key in the second read.
+        events.extend(framer.push(b"ze=100\x07x"));
+
+        assert_eq!(events.len(), 5, "events: {events:?}");
+        match (&events[0], &events[1], &events[2]) {
+            (
+                RawInputEvent::Key(l_key),
+                RawInputEvent::Key(s_key),
+                RawInputEvent::Key(enter),
+            ) => {
+                assert_eq!(l_key.code, crossterm::event::KeyCode::Char('l'));
+                assert_eq!(s_key.code, crossterm::event::KeyCode::Char('s'));
+                assert_eq!(enter.code, crossterm::event::KeyCode::Enter);
+            }
+            other => panic!("expected ls/enter keys, got {other:?}"),
+        }
+        match &events[3] {
+            RawInputEvent::Osc5522(data) => {
+                assert_eq!(data, b"\x1b]5522;type=paste-event:size=100\x07");
+            }
+            other => panic!("expected one complete OSC 5522 blob, got {other:?}"),
+        }
+        match &events[4] {
+            RawInputEvent::Key(x_key) => {
+                assert_eq!(x_key.code, crossterm::event::KeyCode::Char('x'));
+            }
+            other => panic!("expected trailing x key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn osc5522_st_terminator_split_at_escape_boundary() {
+        let mut framer = RawInputFramer::default();
+        assert!(framer.push(b"\x1b]5522;type=read:pw=abc\x1b").is_empty());
+        let events = framer.push(b"\\");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            RawInputEvent::Osc5522(data) => {
+                assert_eq!(data, b"\x1b]5522;type=read:pw=abc\x1b\\");
+            }
+            other => panic!("expected OSC 5522 blob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn osc5522_survives_idle_flush_while_incomplete() {
+        let mut framer = RawInputFramer::default();
+        // Intro split mid-way, then an idle flush, then the rest.
+        assert!(framer.push(b"\x1b]55").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        assert!(framer.push(b"22;type=write:mime=x;aGk=").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        let events = framer.push(b"\x07");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            RawInputEvent::Osc5522(data) => {
+                assert_eq!(data, b"\x1b]5522;type=write:mime=x;aGk=\x07");
+            }
+            other => panic!("expected OSC 5522 blob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn osc5522_over_cap_is_dropped_entirely() {
+        let mut byte_framer = RawInputByteFramer::default();
+        assert!(byte_framer.push(b"\x1b]5522;type=write;").is_empty());
+        let filler = vec![b'A'; OSC5522_MAX_SEQUENCE_BYTES + 1024];
+        assert!(byte_framer.push(&filler).is_empty());
+        // Terminator plus a trailing key: the oversized sequence vanishes,
+        // the key survives.
+        let chunks = byte_framer.push(b"\x07x");
+        assert_eq!(chunks, vec![b"x".to_vec()]);
     }
 }

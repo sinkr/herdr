@@ -44,7 +44,7 @@ use crate::protocol::render_ansi;
 use crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientLaunchMode,
-    ClientMessage, NotifyKind, RenderEncoding, ServerMessage, MAX_FRAME_SIZE,
+    ClientMessage, NotifyKind, RenderEncoding, ServerMessage, SixelSplice, MAX_FRAME_SIZE,
     MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use crate::server::socket_paths::client_socket_path;
@@ -1496,16 +1496,14 @@ async fn run_client_loop(
     let server_read_tx = event_tx.clone();
     let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
     std::thread::spawn(move || {
-        let max_frame_size = if kitty_graphics_enabled {
-            MAX_GRAPHICS_FRAME_SIZE
-        } else {
-            MAX_FRAME_SIZE
-        };
+        // One-shot Sixel passthrough payloads ride render frames regardless
+        // of the Kitty graphics setting, so the reader must always accept
+        // graphics-sized frames.
         server_reader_thread(
             read_stream,
             server_read_tx,
             &server_read_quit,
-            max_frame_size,
+            MAX_GRAPHICS_FRAME_SIZE,
         );
     });
 
@@ -1689,7 +1687,11 @@ async fn run_client_loop(
                 }
             }
             ClientLoopEvent::ServerMessage(msg) => match msg {
-                ServerMessage::Frame(frame_data) => {
+                ServerMessage::Frame {
+                    frame: frame_data,
+                    sixels,
+                    raw_osc,
+                } => {
                     let frame_data = if state.draw_host_cursor {
                         render_ansi::frame_with_drawn_cursor(frame_data)
                     } else {
@@ -1711,8 +1713,22 @@ async fn run_client_loop(
                     } else {
                         &[]
                     };
-                    let _ =
-                        write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
+                    let mut splice_bytes = encode_sixel_splices(
+                        &sixels,
+                        (frame_data.width, frame_data.height),
+                    );
+                    // Raw OSC passthrough records are written verbatim after
+                    // the positioned sixel splices: no positioning, no
+                    // wrapping, same writer and flush as the frame paint.
+                    for record in &raw_osc {
+                        splice_bytes.extend_from_slice(&record.data);
+                    }
+                    let _ = write_encoded_frame_with_graphics(
+                        &mut stdout,
+                        &encoded.bytes,
+                        graphics,
+                        &splice_bytes,
+                    );
                     let _ = stdout.flush();
                     state.blit_encoder.commit(frame_data, encoded);
                     state.repaint_pending = false;
@@ -2347,23 +2363,84 @@ fn forward_clipboard(data: &str) {
 // Frame output
 // ---------------------------------------------------------------------------
 
+/// Writes one semantic frame blit, inserting Kitty graphics and one-shot
+/// Sixel splice bytes before the frame's final synchronized-output end so
+/// they land in the same visual update. `sixels` is already cursor-safe:
+/// each emission carries its own DECSC + CUP + DECRC wrap (see
+/// [`encode_sixel_splices`]); graphics get one shared wrap here.
 fn write_encoded_frame_with_graphics(
     mut writer: impl io::Write,
     encoded: &[u8],
     graphics: &[u8],
+    sixels: &[u8],
 ) -> io::Result<()> {
-    if graphics.is_empty() {
+    if graphics.is_empty() && sixels.is_empty() {
         return writer.write_all(encoded);
     }
 
     let insertion = render_ansi::final_sync_output_end(encoded).unwrap_or(encoded.len());
 
     writer.write_all(&encoded[..insertion])?;
-    record_received_kitty_graphics(graphics);
-    writer.write_all(b"\x1b7")?;
-    writer.write_all(graphics)?;
-    writer.write_all(b"\x1b8")?;
+    if !graphics.is_empty() {
+        record_received_kitty_graphics(graphics);
+        writer.write_all(b"\x1b7")?;
+        writer.write_all(graphics)?;
+        writer.write_all(b"\x1b8")?;
+    }
+    if !sixels.is_empty() {
+        writer.write_all(sixels)?;
+    }
     writer.write_all(&encoded[insertion..])
+}
+
+/// Encodes one-shot Sixel splices delivered with a semantic frame into
+/// positioned terminal writes via [`append_sixel_splice`].
+fn encode_sixel_splices(splices: &[SixelSplice], frame_size: (u16, u16)) -> Vec<u8> {
+    let mut out = Vec::new();
+    for splice in splices {
+        append_sixel_splice(
+            &mut out,
+            Some(splice.rect),
+            splice.row,
+            splice.col,
+            &splice.data,
+            frame_size,
+        );
+    }
+    out
+}
+
+/// Appends one Sixel emission as a cursor-safe positioned write: DECSC
+/// (`ESC 7`) + CUP to the 1-based absolute cell + the raw DCS payload +
+/// DECRC (`ESC 8`).
+///
+/// `pane_rect` is the emitting pane's on-screen content rect for the frame
+/// the splice arrived with; `None` (pane not visible) emits nothing, as
+/// does a pane-local cell that falls outside the rect (pane resized or
+/// scrolled since capture) or an absolute cell outside the frame.
+fn append_sixel_splice(
+    out: &mut Vec<u8>,
+    pane_rect: Option<crate::protocol::SixelPaneRect>,
+    row: u16,
+    col: u16,
+    data: &[u8],
+    frame_size: (u16, u16),
+) {
+    let Some(rect) = pane_rect else {
+        return;
+    };
+    if row >= rect.height || col >= rect.width {
+        return;
+    }
+    let abs_row = u32::from(rect.y) + u32::from(row);
+    let abs_col = u32::from(rect.x) + u32::from(col);
+    if abs_row >= u32::from(frame_size.1) || abs_col >= u32::from(frame_size.0) {
+        return;
+    }
+    out.extend_from_slice(b"\x1b7");
+    out.extend_from_slice(format!("\x1b[{};{}H", abs_row + 1, abs_col + 1).as_bytes());
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\x1b8");
 }
 
 fn contains_kitty_graphics_bytes(bytes: &[u8]) -> bool {
@@ -2964,6 +3041,7 @@ mod tests {
             &mut output,
             b"\x1b[?2026htext\x1b[?2026lcursor",
             b"graphics",
+            b"",
         )
         .unwrap();
 
@@ -2976,9 +3054,109 @@ mod tests {
     #[test]
     fn empty_graphics_writes_only_blit_frame() {
         let mut output = Vec::new();
-        write_encoded_frame_with_graphics(&mut output, b"text", b"").unwrap();
+        write_encoded_frame_with_graphics(&mut output, b"text", b"", b"").unwrap();
 
         assert_eq!(output, b"text");
+    }
+
+    #[test]
+    fn sixel_splice_bytes_are_written_inside_synchronized_blit() {
+        let mut output = Vec::new();
+        write_encoded_frame_with_graphics(
+            &mut output,
+            b"\x1b[?2026htext\x1b[?2026lcursor",
+            b"",
+            b"\x1b7\x1b[2;3Hsixel\x1b8",
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            b"\x1b[?2026htext\x1b7\x1b[2;3Hsixel\x1b8\x1b[?2026lcursor"
+        );
+    }
+
+    #[test]
+    fn sixel_splice_positions_at_pane_rect_plus_pane_local_cell() {
+        let rect = crate::protocol::SixelPaneRect {
+            x: 10,
+            y: 5,
+            width: 40,
+            height: 10,
+        };
+        let mut out = Vec::new();
+        append_sixel_splice(&mut out, Some(rect), 2, 3, b"<data>", (80, 24));
+
+        // CUP is 1-based: row = 5 + 2 + 1, col = 10 + 3 + 1.
+        assert_eq!(out, b"\x1b7\x1b[8;14H<data>\x1b8");
+    }
+
+    #[test]
+    fn sixel_splice_for_invisible_pane_emits_nothing() {
+        let mut out = Vec::new();
+        append_sixel_splice(&mut out, None, 2, 3, b"<data>", (80, 24));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn sixel_splice_outside_pane_rect_or_frame_emits_nothing() {
+        let rect = crate::protocol::SixelPaneRect {
+            x: 10,
+            y: 5,
+            width: 4,
+            height: 3,
+        };
+        let mut out = Vec::new();
+        // Pane-local cell beyond the rect's width/height.
+        append_sixel_splice(&mut out, Some(rect), 3, 0, b"<data>", (80, 24));
+        append_sixel_splice(&mut out, Some(rect), 0, 4, b"<data>", (80, 24));
+        // Rect origin pushes the absolute cell past the frame edge.
+        let clipped = crate::protocol::SixelPaneRect {
+            x: 79,
+            y: 23,
+            width: 4,
+            height: 3,
+        };
+        append_sixel_splice(&mut out, Some(clipped), 1, 1, b"<data>", (80, 24));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn encode_sixel_splices_concatenates_visible_emissions() {
+        let rect = crate::protocol::SixelPaneRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 4,
+        };
+        let splices = vec![
+            SixelSplice {
+                pane_id: 1,
+                rect,
+                row: 0,
+                col: 0,
+                data: b"a".to_vec(),
+            },
+            SixelSplice {
+                pane_id: 1,
+                rect,
+                // Outside the rect: skipped.
+                row: 9,
+                col: 0,
+                data: b"b".to_vec(),
+            },
+            SixelSplice {
+                pane_id: 1,
+                rect,
+                row: 1,
+                col: 2,
+                data: b"c".to_vec(),
+            },
+        ];
+        assert_eq!(
+            encode_sixel_splices(&splices, (80, 24)),
+            b"\x1b7\x1b[1;1Ha\x1b8\x1b7\x1b[2;3Hc\x1b8"
+        );
     }
 
     #[test]
