@@ -4308,7 +4308,7 @@ impl HeadlessServer {
         // placements the pipeline can never transcode, and falling back
         // here put every transcode-declaring client on permanent full
         // renders (12fps spinner ticks = whole-session jank, 2026-08-13).
-        if crate::kitty_graphics::is_enabled() {
+        if self.app.state.kitty_graphics_enabled {
             if client.sixel_transcode_active() {
                 if !client.sixel_transcode.is_empty() {
                     retained_fallback!("sixel_transcode_state_active");
@@ -5125,7 +5125,7 @@ impl HeadlessServer {
             // on placements the disabled pipeline can never emit, which
             // forced permanent full renders every spinner tick: the
             // 2026-08-13 "web window open = whole session janks" incident).
-            let managed_graphics = crate::kitty_graphics::is_enabled();
+            let managed_graphics = self.app.state.kitty_graphics_enabled;
             let sixel_transcode_client = managed_graphics
                 && self
                     .clients
@@ -10821,6 +10821,11 @@ next_tab = ""
         crate::layout::PaneId,
     ) {
         let mut server = test_headless_server();
+        // Transcode lanes only run while the managed Kitty pipeline is on
+        // (a client declaration alone imposes no render obligations), so
+        // the fixture arms the pipeline like production config would. The
+        // cell size stays unknown, keeping the native replay path off.
+        server.app.state.kitty_graphics_enabled = true;
         let mut workspace = crate::workspace::Workspace::test_new("test");
         let pane_id = workspace.focused_pane_id().expect("focused pane");
         workspace.insert_test_runtime(
@@ -11094,6 +11099,9 @@ next_tab = ""
         crate::layout::PaneId,
     ) {
         let mut server = test_headless_server();
+        // Same managed-pipeline arming as `sixel_transcode_test_server`:
+        // IIP transcode has no work while the pipeline is off.
+        server.app.state.kitty_graphics_enabled = true;
         let mut workspace = crate::workspace::Workspace::test_new("test");
         let pane_id = workspace.focused_pane_id().expect("focused pane");
         workspace.insert_test_runtime(
