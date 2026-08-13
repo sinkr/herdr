@@ -483,21 +483,6 @@ impl RawInputByteFramer {
             return chunks;
         }
 
-        // A strict prefix of the OSC 5522 introducer may still become an
-        // enhanced-paste packet whose continuation is in flight; keep
-        // waiting instead of discarding it as an incomplete control string.
-        // Bounded: at most the 7 introducer bytes are ever held.
-        if self.buffer.len() >= 2
-            && self.buffer.len() < OSC5522_INTRO.len()
-            && OSC5522_INTRO.starts_with(&self.buffer)
-        {
-            tracing::trace!(
-                len = self.buffer.len(),
-                "holding possible OSC 5522 introducer prefix"
-            );
-            return chunks;
-        }
-
         if let Some(ControlString::Incomplete { family }) = control_string(&self.buffer) {
             tracing::debug!(
                 len = self.buffer.len(),
@@ -3282,11 +3267,7 @@ mod tests {
 
         assert_eq!(events.len(), 5, "events: {events:?}");
         match (&events[0], &events[1], &events[2]) {
-            (
-                RawInputEvent::Key(l_key),
-                RawInputEvent::Key(s_key),
-                RawInputEvent::Key(enter),
-            ) => {
+            (RawInputEvent::Key(l_key), RawInputEvent::Key(s_key), RawInputEvent::Key(enter)) => {
                 assert_eq!(l_key.code, crossterm::event::KeyCode::Char('l'));
                 assert_eq!(s_key.code, crossterm::event::KeyCode::Char('s'));
                 assert_eq!(enter.code, crossterm::event::KeyCode::Enter);
@@ -3322,12 +3303,34 @@ mod tests {
     }
 
     #[test]
-    fn osc5522_survives_idle_flush_while_incomplete() {
+    fn osc5522_prefix_does_not_survive_idle_flush() {
         let mut framer = RawInputFramer::default();
-        // Intro split mid-way, then an idle flush, then the rest.
+        // An introducer PREFIX abandoned across an idle timeout is stale
+        // input, hygiene-discarded like any other incomplete control
+        // string (real 5522 packets never split the 7-byte introducer
+        // across an idle window); the discard tail swallows the rest of
+        // the would-be sequence through its terminator.
         assert!(framer.push(b"\x1b]55").is_empty());
         assert!(framer.flush_timeout().is_empty());
         assert!(framer.push(b"22;type=write:mime=x;aGk=").is_empty());
+        assert!(framer.push(b"\x07").is_empty());
+        // Following key input is unaffected.
+        let events = framer.push(b"x");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            RawInputEvent::Key(key) => {
+                assert_eq!(key.code, crossterm::event::KeyCode::Char('x'));
+            }
+            other => panic!("expected trailing x key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn osc5522_accumulation_survives_idle_flush() {
+        let mut framer = RawInputFramer::default();
+        // Once the full introducer has arrived the accumulator owns the
+        // stream; a mid-payload idle flush must not drop the packet.
+        assert!(framer.push(b"\x1b]5522;type=write:mime=x;aGk=").is_empty());
         assert!(framer.flush_timeout().is_empty());
         let events = framer.push(b"\x07");
         assert_eq!(events.len(), 1);
