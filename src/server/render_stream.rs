@@ -345,16 +345,24 @@ pub(crate) fn render_virtual(
         area,
         resize_panes,
         crate::kitty_graphics::HostCellSize::default(),
+        crate::kitty_graphics::is_enabled(),
     )
 }
 
+/// `hide_kitty_placeholders` is the per-client blanking value for Kitty
+/// Unicode placeholder glyphs, scoped to this render only: pass the global
+/// [`crate::kitty_graphics::is_enabled`] for parity with the local TUI, or
+/// OR it with the client's Sixel transcode eligibility.
 pub(crate) fn render_virtual_with_runtime_registry(
     app_state: &mut AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     area: Rect,
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
+    hide_kitty_placeholders: bool,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    let _placeholder_scope =
+        crate::kitty_graphics::hide_placeholders_for_render(hide_kitty_placeholders);
     let popup_visible = app_state.popup_pane.is_some();
     let pre_compute_suppresses_focused_terminal_cursor =
         !popup_visible && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
@@ -412,10 +420,16 @@ fn popup_terminal_cursor(
 }
 
 /// Renders one server-owned terminal directly for `terminal attach` clients.
+///
+/// `hide_kitty_placeholders` follows the same per-render contract as
+/// [`render_virtual_with_runtime_registry`].
 pub(crate) fn render_terminal_virtual(
     runtime: &crate::terminal::TerminalRuntime,
     area: Rect,
+    hide_kitty_placeholders: bool,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    let _placeholder_scope =
+        crate::kitty_graphics::hide_placeholders_for_render(hide_kitty_placeholders);
     let suppress_cursor = runtime.synchronized_output_active();
     let backend = CursorTrackingBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
@@ -535,7 +549,8 @@ mod sixel_passthrough_tests {
     }
 
     fn client_frame(runtime: &TerminalRuntime, area: Rect) -> FrameData {
-        let (buffer, cursor) = render_terminal_virtual(runtime, area);
+        let (buffer, cursor) =
+            render_terminal_virtual(runtime, area, crate::kitty_graphics::is_enabled());
         FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &[])
     }
 

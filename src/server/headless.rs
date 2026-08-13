@@ -328,6 +328,9 @@ pub struct HeadlessServer {
     server_config_diagnostic_without_keybindings: Option<String>,
     /// Writable direct attach owner per terminal id string.
     terminal_attach_owners: HashMap<String, u64>,
+    /// Shared cache of encoded Sixel emissions for Kitty→Sixel transcode,
+    /// reused across all Sixel-declaring clients.
+    sixel_encode_cache: crate::sixel_encode::SixelEncodeCache,
     /// Deferred application-history reads currently driving alternate-screen viewports.
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
     /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
@@ -535,6 +538,7 @@ impl HeadlessServer {
             server_config_diagnostic,
             server_config_diagnostic_without_keybindings,
             terminal_attach_owners: HashMap::new(),
+            sixel_encode_cache: crate::sixel_encode::SixelEncodeCache::default(),
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
@@ -3022,6 +3026,7 @@ impl HeadlessServer {
                 render_encoding,
                 direct_attach_requested,
                 direct_graphics,
+                sixel_graphics,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -3044,6 +3049,7 @@ impl HeadlessServer {
                     cell_width_px,
                     cell_height_px,
                     ?render_encoding,
+                    sixel_graphics,
                     "client connected"
                 );
                 let last_activity = self.allocate_activity_stamp();
@@ -3064,6 +3070,7 @@ impl HeadlessServer {
                 );
                 connection.direct_graphics = direct_graphics;
                 connection.pixel_mouse = direct_graphics;
+                connection.sixel_graphics = sixel_graphics;
                 self.clients.insert(client_id, connection);
                 if !direct_attach_requested {
                     self.foreground_client_id = Some(client_id);
@@ -4283,6 +4290,22 @@ impl HeadlessServer {
         {
             retained_fallback!("visible_kitty_graphics");
         }
+        // Sixel transcode mirrors the native Kitty gates above: a client
+        // with live transcode state needs full renders to reposition or
+        // clear emissions, and a visible placement needs a full render to
+        // be transcoded at all (transcode rides full-render frames only).
+        if client.sixel_transcode_active() {
+            if !client.sixel_transcode.is_empty() {
+                retained_fallback!("sixel_transcode_state_active");
+            }
+            if crate::kitty_graphics::has_visible_terminal_kitty_placements(
+                &self.app.state,
+                &self.app.terminal_runtimes,
+                self.app.state.view.tab_surface(),
+            ) {
+                retained_fallback!("visible_sixel_transcode");
+            }
+        }
         let Some(mut frame) = client.render_state.last_frame().cloned() else {
             retained_fallback!("no_last_frame");
         };
@@ -4299,6 +4322,12 @@ impl HeadlessServer {
             retained_fallback!("no_pane_info");
         }
 
+        // Dirty patches splice into the client's retained frame, so they
+        // must blank placeholder glyphs exactly like this client's full
+        // renders do.
+        let _placeholder_scope = crate::kitty_graphics::hide_placeholders_for_render(
+            client.hide_kitty_placeholders(),
+        );
         let mut touched = false;
         for info in pane_infos {
             if !rect_fits_frame(info.inner_rect, &frame) {
@@ -4460,6 +4489,15 @@ impl HeadlessServer {
         }
     }
 
+    /// Per-frame byte budget for Sixel payloads riding one frame — shared
+    /// by passthrough emissions and Kitty→Sixel transcode splices. Large
+    /// enough that any single passthrough emission (capped at 8 MiB by the
+    /// terminal) always fits, so delivery is guaranteed to progress.
+    const SIXEL_FRAME_BUDGET: usize = 9 * 1024 * 1024;
+
+    /// Budget slack per splice record, matching the pane-side estimate.
+    const SIXEL_SPLICE_SLACK: usize = 32;
+
     /// Gathers one pane's pending Sixel emissions for one client.
     ///
     /// TerminalAnsi clients receive pre-encoded DECSC + CUP + DECRC byte
@@ -4485,13 +4523,6 @@ impl HeadlessServer {
         sixel_bytes: &mut Vec<u8>,
         sixel_splices: &mut Vec<protocol::SixelSplice>,
     ) -> PassthroughCollectOutcome {
-        /// Per-frame byte budget for Sixel passthrough payloads. Large
-        /// enough that any single emission (capped at 8 MiB by the
-        /// terminal) always fits, so delivery is guaranteed to progress.
-        const SIXEL_FRAME_BUDGET: usize = 9 * 1024 * 1024;
-        /// Budget slack per splice record, matching the pane-side estimate.
-        const SIXEL_SPLICE_SLACK: usize = 32;
-
         let (watermark, init) = match watermark {
             Some(watermark) => (watermark, None),
             None => {
@@ -4503,19 +4534,19 @@ impl HeadlessServer {
             runtime.encode_pending_sixels_after(
                 watermark,
                 (pane_rect.x, pane_rect.y),
-                SIXEL_FRAME_BUDGET,
+                Self::SIXEL_FRAME_BUDGET,
                 sixel_bytes,
             )
         } else {
             let used = sixel_splices
                 .iter()
-                .map(|splice| splice.data.len() + SIXEL_SPLICE_SLACK)
+                .map(|splice| splice.data.len() + Self::SIXEL_SPLICE_SLACK)
                 .sum();
             let mut pending = Vec::new();
             let advanced = runtime.collect_pending_sixels_after(
                 watermark,
                 used,
-                SIXEL_FRAME_BUDGET,
+                Self::SIXEL_FRAME_BUDGET,
                 &mut pending,
             );
             sixel_splices.extend(pending.into_iter().map(|pending| protocol::SixelSplice {
@@ -4638,6 +4669,91 @@ impl HeadlessServer {
         }
     }
 
+    /// Gathers Kitty→Sixel transcode splices for one client's frame pass.
+    ///
+    /// Walks the same panes the frame just rendered, diffs their Kitty
+    /// placement state against the client's [`SixelTranscodeCache`]
+    /// snapshot, and appends encoded splices for added or changed
+    /// placements. Shares the frame's Sixel byte budget with passthrough
+    /// (`used_bytes` starts at the passthrough total). Returns per-pane
+    /// replacement state that MUST be committed only once the carrying
+    /// frame was sent (or skipped with no splices pending), mirroring the
+    /// passthrough watermark discipline.
+    ///
+    /// [`SixelTranscodeCache`]: crate::kitty_graphics::SixelTranscodeCache
+    fn collect_client_sixel_transcodes(
+        &mut self,
+        client_id: u64,
+        mode: &ClientConnectionMode,
+        client_area: Rect,
+        cell_size: crate::kitty_graphics::HostCellSize,
+        used_bytes: &mut usize,
+        sixel_splices: &mut Vec<protocol::SixelSplice>,
+    ) -> Vec<(crate::layout::PaneId, crate::kitty_graphics::PaneTranscodeState)> {
+        let mut commits = Vec::new();
+        match mode {
+            ClientConnectionMode::App => {
+                if self.app.state.mode != app::Mode::Terminal {
+                    return commits;
+                }
+                let Some(ws_idx) = self.app.state.active else {
+                    return commits;
+                };
+                let pane_infos = self.app.state.view.pane_infos.clone();
+                let Some(client) = self.clients.get(&client_id) else {
+                    return commits;
+                };
+                for info in &pane_infos {
+                    let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
+                        &self.app.terminal_runtimes,
+                        ws_idx,
+                        info.id,
+                    ) else {
+                        continue;
+                    };
+                    let outcome = crate::kitty_graphics::collect_pane_sixel_transcodes(
+                        runtime,
+                        info.id,
+                        info.inner_rect,
+                        cell_size,
+                        Some(&client.sixel_transcode),
+                        &mut self.sixel_encode_cache,
+                        used_bytes,
+                        Self::SIXEL_FRAME_BUDGET,
+                    );
+                    sixel_splices.extend(outcome.splices);
+                    commits.push((info.id, outcome.state));
+                }
+            }
+            ClientConnectionMode::TerminalAttach { terminal_id }
+            | ClientConnectionMode::TerminalObserve { terminal_id } => {
+                let Some(terminal_id) = self.terminal_id_by_string(terminal_id) else {
+                    return commits;
+                };
+                let Some(runtime) = self.app.terminal_runtimes.get(&terminal_id) else {
+                    return commits;
+                };
+                let Some(client) = self.clients.get(&client_id) else {
+                    return commits;
+                };
+                let pane_id = runtime.pane_id();
+                let outcome = crate::kitty_graphics::collect_pane_sixel_transcodes(
+                    runtime,
+                    pane_id,
+                    client_area,
+                    cell_size,
+                    Some(&client.sixel_transcode),
+                    &mut self.sixel_encode_cache,
+                    used_bytes,
+                    Self::SIXEL_FRAME_BUDGET,
+                );
+                sixel_splices.extend(outcome.splices);
+                commits.push((pane_id, outcome.state));
+            }
+        }
+        commits
+    }
+
     fn render_and_stream(&mut self) {
         let full_started = crate::render_prof::timer();
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
@@ -4653,6 +4769,7 @@ impl HeadlessServer {
                 area,
                 resize_panes,
                 crate::kitty_graphics::HostCellSize::default(),
+                crate::kitty_graphics::is_enabled(),
             );
             crate::render_prof::duration_since("full_render.render_virtual", render_started);
             self.app.full_redraw_pending = false;
@@ -4669,6 +4786,11 @@ impl HeadlessServer {
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
+            let hide_kitty_placeholders = self
+                .clients
+                .get(&client_id)
+                .map(ClientConnection::hide_kitty_placeholders)
+                .unwrap_or_else(crate::kitty_graphics::is_enabled);
             let mut frame = match &mode {
                 ClientConnectionMode::App => {
                     let render_started = crate::render_prof::timer();
@@ -4691,6 +4813,7 @@ impl HeadlessServer {
                             area,
                             is_foreground,
                             render_cell_size,
+                            hide_kitty_placeholders,
                         );
                     if let Some((workspace, agent_panel, tab, mobile_switcher)) = preserved_scroll {
                         self.app.state.workspace_scroll = workspace;
@@ -4735,8 +4858,11 @@ impl HeadlessServer {
                         continue;
                     };
                     let render_started = crate::render_prof::timer();
-                    let (buffer, cursor) =
-                        crate::server::render_stream::render_terminal_virtual(runtime, area);
+                    let (buffer, cursor) = crate::server::render_stream::render_terminal_virtual(
+                        runtime,
+                        area,
+                        hide_kitty_placeholders,
+                    );
                     crate::render_prof::duration_since(
                         "full_render.render_terminal_virtual",
                         render_started,
@@ -4883,6 +5009,55 @@ impl HeadlessServer {
                 }
             }
 
+            // Kitty→Sixel transcode for Sixel-declaring SemanticFrame
+            // clients outside the native Kitty replay path: walk the same
+            // panes the frame rendered, diff placement state against the
+            // client's snapshot, and ride encoded splices on this frame.
+            // Replacement state commits only on send success (or on a
+            // skip-identical pass, which implies no splices were pending).
+            let native_kitty_path = is_app_client
+                && self.app.state.kitty_graphics_enabled
+                && cell_size.is_known();
+            let sixel_transcode_client = self
+                .clients
+                .get(&client_id)
+                .is_some_and(ClientConnection::sixel_transcode_active);
+            let mut transcode_commits: Vec<(
+                crate::layout::PaneId,
+                crate::kitty_graphics::PaneTranscodeState,
+            )> = Vec::new();
+            if sixel_transcode_client && !native_kitty_path {
+                let mut used_bytes = sixel_bytes.len()
+                    + sixel_splices
+                        .iter()
+                        .map(|splice| splice.data.len() + Self::SIXEL_SPLICE_SLACK)
+                        .sum::<usize>();
+                transcode_commits = self.collect_client_sixel_transcodes(
+                    client_id,
+                    &mode,
+                    area,
+                    cell_size,
+                    &mut used_bytes,
+                    &mut sixel_splices,
+                );
+                // Panes tracked by this client but absent from this frame
+                // pass (tab switch, overlay, pane close) get their state
+                // cleared: the frame overdrew their cells, so returning
+                // placements must re-emit as additions.
+                if let Some(client) = self.clients.get(&client_id) {
+                    let visited: HashSet<crate::layout::PaneId> =
+                        transcode_commits.iter().map(|(id, _)| *id).collect();
+                    for pane_id in client.sixel_transcode.tracked_panes() {
+                        if !visited.contains(&pane_id) {
+                            transcode_commits.push((
+                                pane_id,
+                                crate::kitty_graphics::PaneTranscodeState::default(),
+                            ));
+                        }
+                    }
+                }
+            }
+
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
             };
@@ -4973,6 +5148,12 @@ impl HeadlessServer {
                 for (pane_id, watermark) in osc_commits.drain(..) {
                     client.osc_watermarks.insert(pane_id, watermark);
                 }
+                // Same for transcode state: a skip means no splices were
+                // pending, so the replacement state only records removals
+                // and permanent drops.
+                for (pane_id, state) in transcode_commits.drain(..) {
+                    client.sixel_transcode.commit(pane_id, state);
+                }
                 crate::render_prof::event("full_render.skip_identical");
                 continue;
             };
@@ -4999,6 +5180,7 @@ impl HeadlessServer {
                     // they retry on the next frame.
                     sixel_commits.clear();
                     osc_commits.clear();
+                    transcode_commits.clear();
                     let Some(text_only_prepared) =
                         client.render_state.prepare_frame(text_only_frame)
                     else {
@@ -5047,6 +5229,9 @@ impl HeadlessServer {
                     }
                     for (pane_id, watermark) in osc_commits.drain(..) {
                         client.osc_watermarks.insert(pane_id, watermark);
+                    }
+                    for (pane_id, state) in transcode_commits.drain(..) {
+                        client.sixel_transcode.commit(pane_id, state);
                     }
                     if encoded.incomplete {
                         client.defer_full_render();
@@ -5776,6 +5961,7 @@ mod tests {
             server_config_diagnostic: None,
             server_config_diagnostic_without_keybindings: None,
             terminal_attach_owners: HashMap::new(),
+            sixel_encode_cache: crate::sixel_encode::SixelEncodeCache::default(),
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
@@ -5904,6 +6090,7 @@ mod tests {
             Rect::new(0, 0, 100, 30),
             true,
             crate::kitty_graphics::HostCellSize::default(),
+            crate::kitty_graphics::is_enabled(),
         );
         let rendered = buffer
             .content
@@ -6572,6 +6759,7 @@ mod tests {
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: true,
+            sixel_graphics: false,
             writer: writer_a,
         }));
         assert!(server.clients[&1].direct_graphics);
@@ -6589,6 +6777,7 @@ mod tests {
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            sixel_graphics: false,
             writer: writer_b,
         }));
         assert!(!server.direct_graphics_available());
@@ -6619,6 +6808,7 @@ new_tab = "prefix+t"
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
+            sixel_graphics: false,
             writer: writer_a,
         }));
         assert_eq!(
@@ -6644,6 +6834,7 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            sixel_graphics: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -6685,6 +6876,7 @@ new_tab = "prefix+t"
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
+            sixel_graphics: false,
             writer: writer_a,
         }));
         assert_eq!(server.app.state.config_diagnostic, without_keybindings);
@@ -6699,6 +6891,7 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            sixel_graphics: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -6743,6 +6936,7 @@ next_tab = ""
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
+            sixel_graphics: false,
             writer,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -6819,6 +7013,7 @@ next_tab = ""
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
             direct_graphics: false,
+            sixel_graphics: false,
             writer: writer_a,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -6840,6 +7035,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            sixel_graphics: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -6875,6 +7071,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            sixel_graphics: false,
             writer,
         }));
         assert!(server.clients.contains_key(&7));
@@ -6941,6 +7138,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            sixel_graphics: false,
             writer,
         }));
         control_rx
@@ -7355,6 +7553,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            sixel_graphics: false,
             writer,
         }));
 
@@ -7390,6 +7589,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            sixel_graphics: false,
             writer,
         }));
 
@@ -7424,6 +7624,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            sixel_graphics: false,
             writer,
         }));
         assert!(server.has_app_client());
@@ -7525,6 +7726,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            sixel_graphics: false,
             writer,
         }));
         assert!(
@@ -9576,6 +9778,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            sixel_graphics: false,
             writer,
         }));
         assert!(
@@ -10436,6 +10639,133 @@ next_tab = ""
         );
     }
 
+    /// Kitty APC bytes creating a 2×1-cell Unicode-placeholder virtual
+    /// placement of a 1×1 red RGBA image, with placeholder cells at pane
+    /// row 1, columns 2-3 (matching the ghostty placeholder test recipe).
+    const KITTY_VIRTUAL_PLACEMENT: &str = concat!(
+        "\x1b_Gq=2,a=t,t=d,f=32,s=1,v=1,i=1193046,m=0;/wAA/w==\x1b\\",
+        "\x1b_Gq=2,a=p,U=1,i=1193046,c=2,r=1\x1b\\",
+        "\x1b[2;3H\x1b[38;2;18;52;86m\u{10eeee}\u{0305}\u{0305}\u{10eeee}\u{0305}\u{030d}\x1b[0m",
+    );
+
+    fn sixel_transcode_test_server() -> (
+        HeadlessServer,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        crate::layout::PaneId,
+    ) {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("test");
+        let pane_id = workspace.focused_pane_id().expect("focused pane");
+        workspace.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_kitty_graphics_screen_bytes(
+                80,
+                24,
+                KITTY_VIRTUAL_PLACEMENT.as_bytes(),
+            ),
+        );
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let (client_tx, _client_control_rx, client_rx) = test_client_writer();
+        let mut connection = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(client_tx),
+        );
+        connection.sixel_graphics = true;
+        server.clients.insert(1, connection);
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        (server, client_rx, pane_id)
+    }
+
+    #[tokio::test]
+    async fn kitty_placement_transcodes_to_sixel_splice_exactly_once() {
+        let (mut server, client_rx, pane_id) = sixel_transcode_test_server();
+
+        // First frame: the virtual placement is transcoded into exactly one
+        // positioned Sixel splice, and the placeholder glyphs are blanked
+        // out of the frame text for this client.
+        server.render_and_stream();
+        let (frame, sixels) = read_server_frame_with_sixels(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
+        assert!(
+            !frame_text(&frame).contains('\u{10eeee}'),
+            "placeholder glyphs must be blanked for sixel clients"
+        );
+        let inner_rect = server.app.state.view.pane_infos[0].inner_rect;
+        assert_eq!(sixels.len(), 1, "one transcoded splice expected");
+        assert_eq!(sixels[0].pane_id, pane_id.raw());
+        assert_eq!(
+            sixels[0].rect,
+            protocol::SixelPaneRect {
+                x: inner_rect.x,
+                y: inner_rect.y,
+                width: inner_rect.width,
+                height: inner_rect.height,
+            }
+        );
+        // Placeholder run sits at pane row 1, columns 2-3.
+        assert_eq!((sixels[0].row, sixels[0].col), (1, 2));
+        // The payload is a complete Sixel DCS scaled to the 2×1-cell rect
+        // at the 9×18 fallback cell size.
+        assert!(sixels[0].data.starts_with(b"\x1bP0;1;0q"));
+        assert!(sixels[0].data.ends_with(b"\x1b\\"));
+        let text = String::from_utf8(sixels[0].data.clone()).expect("ascii sixel");
+        assert!(text.contains("\"1;1;18;18"), "raster dims: {text:?}");
+        assert!(
+            !server.clients[&1].sixel_transcode.is_empty(),
+            "transcode state commits after send success"
+        );
+
+        // An identical second frame emits nothing at all.
+        server.render_and_stream();
+        assert!(
+            client_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "unchanged placement must not re-emit"
+        );
+
+        // Moving the placement (erase the old run, write it two rows down
+        // and two columns right) re-emits exactly once at the new cell.
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(
+            "\x1b[2;3H  \x1b[4;5H\x1b[38;2;18;52;86m\u{10eeee}\u{0305}\u{0305}\u{10eeee}\u{0305}\u{030d}\x1b[0m"
+                .as_bytes(),
+        );
+        server.render_and_stream();
+        let (_, sixels) = read_server_frame_with_sixels(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("moved placement frame"),
+        );
+        assert_eq!(sixels.len(), 1, "moved placement re-emits once");
+        assert_eq!((sixels[0].row, sixels[0].col), (3, 4));
+        assert!(sixels[0].data.starts_with(b"\x1bP0;1;0q"));
+
+        // And the move settles: nothing further rides the next pass.
+        server.render_and_stream();
+        assert!(
+            client_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "settled placement must not re-emit"
+        );
+    }
+
     /// Full OSC 5522 sequence, byte-identical to what the pane queues.
     const SEMANTIC_RAW_OSC: &[u8] = b"\x1b]5522;type=read:pw=abc\x07";
 
@@ -10696,6 +11026,7 @@ next_tab = ""
             ratatui::layout::Rect::new(0, 0, 80, 24),
             true,
             crate::kitty_graphics::HostCellSize::default(),
+            crate::kitty_graphics::is_enabled(),
         );
         let (_, inner) =
             crate::ui::popup_pane_rects(&server.app.state, server.app.state.view.terminal_area)
@@ -10736,6 +11067,7 @@ next_tab = ""
             ratatui::layout::Rect::new(0, 0, 80, 24),
             true,
             crate::kitty_graphics::HostCellSize::default(),
+            crate::kitty_graphics::is_enabled(),
         );
 
         assert_eq!(

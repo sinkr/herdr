@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 /// Current protocol version. Bumped when wire format changes incompatibly.
 /// v22: semantic `Frame` messages carry one-shot Sixel passthrough splices
 /// and one-shot raw OSC 5522 passthrough records (`raw_osc`).
-pub const PROTOCOL_VERSION: u32 = 22;
+/// v23: `Hello` carries `sixel_graphics`, the client's declaration that its
+/// outer terminal renders Sixel (drives server-side Kitty→Sixel transcode).
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -361,6 +363,9 @@ pub enum ClientMessage {
         keybindings: ClientKeybindings,
         /// Whether this connection will render the full app or attach directly to a pane terminal.
         launch_mode: ClientLaunchMode,
+        /// True when the client's outer terminal renders Sixel graphics and
+        /// the client wants Kitty placements transcoded into Sixel splices.
+        sixel_graphics: bool,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -1103,11 +1108,17 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            sixel_graphics: true,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn protocol_version_is_23_for_sixel_capability_hello() {
+        assert_eq!(PROTOCOL_VERSION, 23);
     }
 
     #[test]
@@ -1140,6 +1151,7 @@ mod tests {
                 requested_encoding: RenderEncoding::SemanticFrame,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                sixel_graphics: false,
             }),
             0
         );
@@ -1748,6 +1760,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            sixel_graphics: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1826,6 +1839,7 @@ mod tests {
                     requested_encoding: RenderEncoding::SemanticFrame,
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::App,
+                    sixel_graphics: (i % 2) == 0,
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -2262,6 +2276,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            sixel_graphics: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2298,6 +2313,7 @@ mod tests {
                 requested_encoding: RenderEncoding::SemanticFrame,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                sixel_graphics: false,
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),

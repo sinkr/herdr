@@ -3164,6 +3164,44 @@ impl PaneRuntime {
             rx,
         )
     }
+
+    /// Like [`Self::test_with_screen_bytes`], but with Kitty graphics
+    /// enabled on the terminal (and an 8×16 px cell size) so kitty APC
+    /// transmissions and Unicode placeholder placements are queryable.
+    pub(crate) fn test_with_kitty_graphics_screen_bytes(
+        cols: u16,
+        rows: u16,
+        bytes: &[u8],
+    ) -> Self {
+        let (tx, _rx) = mpsc::channel(4);
+        let (resize_tx, _resize_rx) = watch::channel((rows, cols, 0, 0));
+        let mut terminal = crate::ghostty::Terminal::new(cols, rows, 0).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        terminal.resize(cols, rows, 8, 16).unwrap();
+        terminal.write(bytes);
+
+        Self {
+            pane_id: PaneId::from_raw(0),
+            terminal: Arc::new(PaneTerminal::new(
+                GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
+            )),
+            io: PaneRuntimeIo::TestChannel {
+                sender: tx,
+                resize_tx,
+            },
+            current_size: Cell::new((rows, cols, 8, 16)),
+            child_pid: Arc::new(AtomicU32::new(0)),
+            reported_cwd: Arc::new(Mutex::new(None)),
+            child_wait_completed: None,
+            kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
+            detection_content_seq: Arc::new(AtomicU64::new(0)),
+            full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
+            detect_reset_notify: Arc::new(Notify::new()),
+            pending_release: Arc::new(Mutex::new(None)),
+            preserve_processes_on_drop: true,
+            detect_handle: Some(tokio::spawn(async {}).abort_handle()),
+        }
+    }
 }
 
 #[cfg(test)]

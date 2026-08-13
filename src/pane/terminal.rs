@@ -2441,7 +2441,7 @@ impl GhosttyPaneTerminal {
         let palette_overrides = colors
             .zip(terminal.default_palette().ok())
             .and_then(|(colors, default)| PaletteOverrides::new(&colors.palette, &default));
-        let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
+        let hide_kitty_placeholders = crate::kitty_graphics::placeholders_hidden();
 
         let mut row_iterator = match crate::ghostty::RowIterator::new() {
             Ok(iterator) => iterator,
@@ -2762,7 +2762,7 @@ fn ghostty_collect_dirty_patch(
     let palette_overrides = colors
         .zip(terminal.default_palette().ok())
         .and_then(|(colors, default)| PaletteOverrides::new(&colors.palette, &default));
-    let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
+    let hide_kitty_placeholders = crate::kitty_graphics::placeholders_hidden();
 
     let Ok(mut row_iterator) = crate::ghostty::RowIterator::new() else {
         fallback!("row_iterator_new_error");
@@ -5890,9 +5890,7 @@ mod tests {
         assert_eq!(buffer[(2, 0)].style().bg, Some(Color::Reset));
     }
 
-    #[test]
-    fn render_blanks_kitty_unicode_placeholders_when_graphics_enabled() {
-        crate::kitty_graphics::set_enabled(true);
+    fn pane_with_kitty_placeholder_row() -> GhosttyPaneTerminal {
         let (tx, _rx) = mpsc::channel(4);
         let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
         let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
@@ -5901,20 +5899,49 @@ mod tests {
             core.terminal
                 .write("before\u{10eeee}\u{0305}\u{0305}after".as_bytes());
         }
+        pane
+    }
 
+    fn draw_placeholder_pane(pane: &GhosttyPaneTerminal) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(20, 5);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 5), false))
             .unwrap();
-        crate::kitty_graphics::set_enabled(false);
+        terminal.backend().buffer().clone()
+    }
 
-        let buffer = terminal.backend().buffer();
+    #[test]
+    fn render_blanks_kitty_unicode_placeholders_when_graphics_enabled() {
+        let pane = pane_with_kitty_placeholder_row();
+
+        // Per-render hiding, as installed by the server for clients with
+        // Kitty replay or Sixel transcode (and by the local TUI through
+        // the global flag).
+        let buffer = {
+            let _hide = crate::kitty_graphics::hide_placeholders_for_render(true);
+            draw_placeholder_pane(&pane)
+        };
+
         assert_eq!(buffer[(0, 0)].symbol(), "b");
         assert_eq!(buffer[(6, 0)].symbol(), " ");
         assert_eq!(buffer[(7, 0)].symbol(), "a");
         assert_eq!(pane.visible_text().lines().next(), Some("before after"));
         assert_eq!(pane.recent_text(5), "before after\n");
+    }
+
+    #[test]
+    fn render_keeps_kitty_unicode_placeholders_when_hiding_disabled() {
+        let pane = pane_with_kitty_placeholder_row();
+
+        let buffer = {
+            let _show = crate::kitty_graphics::hide_placeholders_for_render(false);
+            draw_placeholder_pane(&pane)
+        };
+
+        assert_eq!(buffer[(0, 0)].symbol(), "b");
+        assert_eq!(buffer[(6, 0)].symbol(), "\u{10eeee}\u{0305}\u{0305}");
+        assert_eq!(buffer[(7, 0)].symbol(), "a");
     }
 
     #[test]

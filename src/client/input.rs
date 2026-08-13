@@ -570,7 +570,7 @@ fn stdin_read_ready<R: AsRawFd>(reader: &R, timeout_ms: i32) -> Option<bool> {
 }
 
 #[cfg(unix)]
-fn poll_read_ready(fd: i32, timeout_ms: i32) -> Option<bool> {
+pub(crate) fn poll_read_ready(fd: i32, timeout_ms: i32) -> Option<bool> {
     #[repr(C)]
     struct PollFd {
         fd: i32,

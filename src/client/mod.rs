@@ -840,6 +840,7 @@ fn do_handshake(
     exact_cell_size: bool,
     requested_encoding: RenderEncoding,
     direct_attach_requested: bool,
+    sixel_graphics: bool,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
@@ -860,6 +861,7 @@ fn do_handshake(
             cell_width_px,
             cell_height_px,
         ),
+        sixel_graphics,
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -1040,6 +1042,7 @@ fn connect_terminal_session_stream(
         false,
         RenderEncoding::TerminalAnsi,
         true,
+        false,
     ) {
         Ok(RenderEncoding::TerminalAnsi) => {}
         Ok(encoding) => {
@@ -1261,6 +1264,11 @@ fn run_client_with_mode(
     let (cols, rows, cell_width_px, cell_height_px, exact_cell_size) =
         initial_terminal_geometry(kitty_graphics_enabled);
 
+    // Resolve the outer terminal's Sixel capability before the handshake:
+    // the probe manages raw mode itself and must not race the client loop.
+    let sixel_graphics =
+        !direct_attach_requested && sixel_graphics_capability(kitty_graphics_enabled);
+
     // Perform handshake while the stream is still in blocking mode.
     let negotiated_encoding = match do_handshake(
         &mut stream,
@@ -1271,6 +1279,7 @@ fn run_client_with_mode(
         exact_cell_size,
         requested_encoding,
         direct_attach_requested,
+        sixel_graphics,
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
@@ -2694,6 +2703,137 @@ fn write_host_cell_size_query(mut writer: impl io::Write) -> io::Result<()> {
     writer.flush()
 }
 
+/// DA1 (Primary Device Attributes) request, mirroring the
+/// [`HOST_CELL_SIZE_QUERY`] probe pattern for the outer terminal.
+const HOST_DA1_QUERY: &[u8] = b"\x1b[c";
+
+/// How long the pre-handshake DA1 probe waits for the outer terminal's
+/// reply before assuming no Sixel support.
+#[cfg(unix)]
+const DA1_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Environment override for the Sixel capability declared in Hello:
+/// `1` forces it on, `0` forces it off, anything else defers to the probe.
+const FORCE_SIXEL_ENV_VAR: &str = "HERDR_FORCE_SIXEL";
+
+/// Resolves the `sixel_graphics` value for this client's Hello.
+///
+/// `HERDR_FORCE_SIXEL=1`/`0` wins outright. Otherwise the outer terminal
+/// is probed with DA1 only when client-side Kitty graphics are disabled
+/// (a Kitty-capable outer terminal takes the native replay path instead).
+fn sixel_graphics_capability(kitty_graphics_enabled: bool) -> bool {
+    match std::env::var(FORCE_SIXEL_ENV_VAR).ok().as_deref() {
+        Some("1") => return true,
+        Some("0") => return false,
+        _ => {}
+    }
+    if kitty_graphics_enabled {
+        return false;
+    }
+    probe_outer_terminal_sixel()
+}
+
+/// Parses an accumulated DA1 reply (`ESC [ ? Ps ; ... c`).
+///
+/// Returns `Some(true)` when the attribute list contains `4` (Sixel),
+/// `Some(false)` for a complete reply without it, and `None` while no
+/// complete reply has arrived yet.
+fn parse_da1_sixel_reply(buffer: &[u8]) -> Option<bool> {
+    let mut index = 0;
+    while let Some(start) = find_subslice(&buffer[index..], b"\x1b[?") {
+        let params_start = index + start + 3;
+        let mut end = params_start;
+        while end < buffer.len() && matches!(buffer[end], b'0'..=b'9' | b';') {
+            end += 1;
+        }
+        if end >= buffer.len() {
+            return None;
+        }
+        if buffer[end] == b'c' {
+            let mut fields = buffer[params_start..end].split(|byte| *byte == b';');
+            // The first parameter is the device class; Sixel is attribute 4
+            // in the remainder.
+            let _class = fields.next();
+            return Some(fields.any(|field| field == b"4"));
+        }
+        index = end.max(params_start);
+    }
+    None
+}
+
+/// Probes the outer terminal's DA1 attributes for Sixel support.
+///
+/// Runs before the handshake (and before the client's terminal setup), so
+/// it briefly enables raw mode itself and restores it. Any timeout, probe
+/// failure, or non-TTY stdio reports no Sixel support. A reply arriving
+/// after the timeout is consumed and dropped later by the raw input
+/// framer's unsupported-sequence handling.
+#[cfg(unix)]
+fn probe_outer_terminal_sixel() -> bool {
+    use std::io::IsTerminal;
+    let stdin = io::stdin();
+    if !stdin.is_terminal() || !io::stdout().is_terminal() {
+        return false;
+    }
+    if crossterm::terminal::enable_raw_mode().is_err() {
+        return false;
+    }
+    let sixel = run_da1_probe(&stdin);
+    let _ = crossterm::terminal::disable_raw_mode();
+    debug!(sixel, "probed outer terminal DA1 for sixel support");
+    sixel
+}
+
+#[cfg(windows)]
+fn probe_outer_terminal_sixel() -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn run_da1_probe(stdin: &io::Stdin) -> bool {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let mut stdout = io::stdout();
+    if stdout
+        .write_all(HOST_DA1_QUERY)
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        return false;
+    }
+
+    let deadline = std::time::Instant::now() + DA1_PROBE_TIMEOUT;
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match crate::client::input::poll_read_ready(
+            stdin.as_raw_fd(),
+            remaining.as_millis().min(i32::MAX as u128) as i32,
+        ) {
+            Some(true) => {}
+            _ => return false,
+        }
+        let Ok(read) = stdin.lock().read(&mut chunk) else {
+            return false;
+        };
+        if read == 0 {
+            return false;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(sixel) = parse_da1_sixel_reply(&buffer) {
+            return sixel;
+        }
+        if buffer.len() > 4096 {
+            return false;
+        }
+    }
+}
+
 #[cfg(any(unix, test))]
 fn store_reported_cell_size(reported_cell_size: &AtomicU64, width_px: u32, height_px: u32) {
     let packed = pack_cell_size(width_px, height_px);
@@ -2801,6 +2941,47 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             restore_env_var(self.key, self.previous.clone());
+        }
+    }
+
+    #[test]
+    fn da1_reply_parsing_detects_sixel_attribute() {
+        // Incomplete replies keep waiting.
+        assert_eq!(parse_da1_sixel_reply(b""), None);
+        assert_eq!(parse_da1_sixel_reply(b"\x1b[?63;1;2;"), None);
+        // Sixel is attribute 4 after the device-class parameter.
+        assert_eq!(parse_da1_sixel_reply(b"\x1b[?63;1;2;4;6c"), Some(true));
+        assert_eq!(parse_da1_sixel_reply(b"\x1b[?64;4c"), Some(true));
+        assert_eq!(parse_da1_sixel_reply(b"\x1b[?6c"), Some(false));
+        // The class parameter alone is not a Sixel attribute...
+        assert_eq!(parse_da1_sixel_reply(b"\x1b[?4c"), Some(false));
+        // ...and 40 is not 4.
+        assert_eq!(parse_da1_sixel_reply(b"\x1b[?63;40c"), Some(false));
+        // Unrelated bytes and CSI ? sequences before the reply are skipped.
+        assert_eq!(parse_da1_sixel_reply(b"xx\x1b[?62;4c"), Some(true));
+        assert_eq!(
+            parse_da1_sixel_reply(b"\x1b[?1049h\x1b[?63;4c"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn force_sixel_env_overrides_capability() {
+        let _lock = env_lock().lock().unwrap();
+        {
+            let _force_on = EnvVarGuard::set(FORCE_SIXEL_ENV_VAR, "1");
+            assert!(sixel_graphics_capability(true), "=1 wins over kitty");
+            assert!(sixel_graphics_capability(false));
+        }
+        {
+            let _force_off = EnvVarGuard::set(FORCE_SIXEL_ENV_VAR, "0");
+            assert!(!sixel_graphics_capability(false), "=0 forces off");
+        }
+        {
+            let _unset = EnvVarsRemovedGuard::new(&[FORCE_SIXEL_ENV_VAR]);
+            // Kitty-enabled clients never probe: the native replay path
+            // takes precedence.
+            assert!(!sixel_graphics_capability(true));
         }
     }
 

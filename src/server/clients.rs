@@ -55,6 +55,12 @@ pub(crate) struct ClientConnection {
     pub(crate) render_state: ClientRenderState,
     /// Client-local host Kitty graphics cache.
     pub(crate) graphics_cache: crate::kitty_graphics::HostGraphicsCache,
+    /// Per-client Kitty→Sixel transcode signature state, populated only
+    /// for SemanticFrame clients that declared `sixel_graphics`.
+    pub(crate) sixel_transcode: crate::kitty_graphics::SixelTranscodeCache,
+    /// True when the client's Hello declared a Sixel-capable outer
+    /// terminal (drives Kitty→Sixel transcode and placeholder blanking).
+    pub(crate) sixel_graphics: bool,
     /// Per-pane watermark of the highest Sixel emission sequence sent to
     /// this client. Emissions at or below the watermark are never re-sent.
     pub(crate) sixel_watermarks: HashMap<crate::layout::PaneId, u64>,
@@ -135,6 +141,8 @@ impl ClientConnection {
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
+            sixel_transcode: crate::kitty_graphics::SixelTranscodeCache::default(),
+            sixel_graphics: false,
             sixel_watermarks: HashMap::new(),
             osc_watermarks: HashMap::new(),
             direct_graphics: false,
@@ -177,6 +185,21 @@ impl ClientConnection {
 
     pub(crate) fn is_full_app_client(&self) -> bool {
         matches!(self.mode, ClientConnectionMode::App) && !self.pending_terminal_attach
+    }
+
+    /// True when this client receives Kitty placements transcoded into
+    /// Sixel splices: it declared a Sixel-capable outer terminal and takes
+    /// SemanticFrame renders (TerminalAnsi stays passthrough-only).
+    pub(crate) fn sixel_transcode_active(&self) -> bool {
+        self.sixel_graphics && !self.render_state.is_terminal_ansi()
+    }
+
+    /// Per-render Kitty placeholder blanking value for this client: the
+    /// server-global Kitty replay behavior, or forced on when the client
+    /// receives Sixel transcodes (the placeholder glyphs would otherwise
+    /// shadow the transcoded image cells).
+    pub(crate) fn hide_kitty_placeholders(&self) -> bool {
+        crate::kitty_graphics::is_enabled() || self.sixel_transcode_active()
     }
 
     pub(crate) fn request_semantic_redraw_after_input(&mut self) {

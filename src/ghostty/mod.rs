@@ -751,13 +751,13 @@ unsafe extern "C" fn decode_png_trampoline(
     true
 }
 
-struct DecodedPng {
-    width: u32,
-    height: u32,
-    data: Vec<u8>,
+pub(crate) struct DecodedPng {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) data: Vec<u8>,
 }
 
-fn decode_png_rgba(bytes: &[u8]) -> Option<DecodedPng> {
+pub(crate) fn decode_png_rgba(bytes: &[u8]) -> Option<DecodedPng> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;
