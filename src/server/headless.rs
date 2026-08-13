@@ -5110,8 +5110,6 @@ impl HeadlessServer {
             // this frame. IIP wins when a client declared both formats.
             // Replacement state commits only on send success (or on a
             // skip-identical pass, which implies no splices were pending).
-            let native_kitty_path =
-                is_app_client && self.app.state.kitty_graphics_enabled && cell_size.is_known();
             let sixel_transcode_client = self
                 .clients
                 .get(&client_id)
@@ -5120,6 +5118,15 @@ impl HeadlessServer {
                 .clients
                 .get(&client_id)
                 .is_some_and(ClientConnection::iip_transcode_active);
+            // A declared Sixel/IIP outer terminal does not render native
+            // Kitty graphics: the client's declaration beats the
+            // config-global replay path, whose cell size may be the
+            // client-side fallback rather than a real ioctl report.
+            let native_kitty_path = is_app_client
+                && self.app.state.kitty_graphics_enabled
+                && cell_size.is_known()
+                && !sixel_transcode_client
+                && !iip_transcode_client;
             let mut transcode_commits: Vec<(
                 crate::layout::PaneId,
                 crate::kitty_graphics::PaneTranscodeState,
@@ -5195,10 +5202,7 @@ impl HeadlessServer {
             };
             let mut next_graphics_cache = client.graphics_cache.clone();
             let mut reset_graphics = Vec::new();
-            let mut encoded = if is_app_client
-                && self.app.state.kitty_graphics_enabled
-                && cell_size.is_known()
-            {
+            let mut encoded = if native_kitty_path {
                 if client.graphics_surface_reset_pending {
                     if self.app.pane_graphics.slots.is_empty() {
                         reset_graphics = next_graphics_cache.clear_bytes();
