@@ -4303,29 +4303,36 @@ impl HeadlessServer {
         // with live transcode state needs full renders to reposition or
         // clear emissions, and a visible placement needs a full render to
         // be transcoded at all (transcode rides full-render frames only).
-        if client.sixel_transcode_active() {
-            if !client.sixel_transcode.is_empty() {
-                retained_fallback!("sixel_transcode_state_active");
+        // Both obligations exist ONLY while the managed pipeline is on:
+        // with kitty_graphics disabled the VT-visibility probe still sees
+        // placements the pipeline can never transcode, and falling back
+        // here put every transcode-declaring client on permanent full
+        // renders (12fps spinner ticks = whole-session jank, 2026-08-13).
+        if crate::kitty_graphics::is_enabled() {
+            if client.sixel_transcode_active() {
+                if !client.sixel_transcode.is_empty() {
+                    retained_fallback!("sixel_transcode_state_active");
+                }
+                if crate::kitty_graphics::has_visible_terminal_kitty_placements(
+                    &self.app.state,
+                    &self.app.terminal_runtimes,
+                    self.app.state.view.tab_surface(),
+                ) {
+                    retained_fallback!("visible_sixel_transcode");
+                }
             }
-            if crate::kitty_graphics::has_visible_terminal_kitty_placements(
-                &self.app.state,
-                &self.app.terminal_runtimes,
-                self.app.state.view.tab_surface(),
-            ) {
-                retained_fallback!("visible_sixel_transcode");
-            }
-        }
-        // IIP transcode shares the same retained-render obligations.
-        if client.iip_transcode_active() {
-            if !client.iip_transcode.is_empty() {
-                retained_fallback!("iip_transcode_state_active");
-            }
-            if crate::kitty_graphics::has_visible_terminal_kitty_placements(
-                &self.app.state,
-                &self.app.terminal_runtimes,
-                self.app.state.view.tab_surface(),
-            ) {
-                retained_fallback!("visible_iip_transcode");
+            // IIP transcode shares the same retained-render obligations.
+            if client.iip_transcode_active() {
+                if !client.iip_transcode.is_empty() {
+                    retained_fallback!("iip_transcode_state_active");
+                }
+                if crate::kitty_graphics::has_visible_terminal_kitty_placements(
+                    &self.app.state,
+                    &self.app.terminal_runtimes,
+                    self.app.state.view.tab_surface(),
+                ) {
+                    retained_fallback!("visible_iip_transcode");
+                }
             }
         }
         let Some(mut frame) = client.render_state.last_frame().cloned() else {
@@ -5110,14 +5117,25 @@ impl HeadlessServer {
             // this frame. IIP wins when a client declared both formats.
             // Replacement state commits only on send success (or on a
             // skip-identical pass, which implies no splices were pending).
-            let sixel_transcode_client = self
-                .clients
-                .get(&client_id)
-                .is_some_and(ClientConnection::sixel_transcode_active);
-            let iip_transcode_client = self
-                .clients
-                .get(&client_id)
-                .is_some_and(ClientConnection::iip_transcode_active);
+            // Transcode lanes only have work when the managed Kitty pipeline
+            // is on: with `[experimental] kitty_graphics = false` no managed
+            // placements exist, so a declared Sixel/IIP client must impose
+            // ZERO render obligations (no collects, and critically no
+            // retained-render fallbacks — the VT-state visibility probe fires
+            // on placements the disabled pipeline can never emit, which
+            // forced permanent full renders every spinner tick: the
+            // 2026-08-13 "web window open = whole session janks" incident).
+            let managed_graphics = crate::kitty_graphics::is_enabled();
+            let sixel_transcode_client = managed_graphics
+                && self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(ClientConnection::sixel_transcode_active);
+            let iip_transcode_client = managed_graphics
+                && self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(ClientConnection::iip_transcode_active);
             // A declared Sixel/IIP outer terminal does not render native
             // Kitty graphics: the client's declaration beats the
             // config-global replay path, whose cell size may be the
