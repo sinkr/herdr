@@ -81,7 +81,9 @@ pub(crate) fn crop_rgba(
     if w == 0 || h == 0 {
         return None;
     }
-    let expected = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    let expected = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
     if rgba.len() < expected {
         return None;
     }
@@ -378,12 +380,7 @@ impl SixelEncodeCache {
         self.total_bytes += data.len();
         self.entries.insert(key, (data, self.stamp));
         while self.total_bytes > self.cap_bytes && self.entries.len() > 1 {
-            let Some((&victim, _)) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, (_, used))| *used)
-                .map(|(key, value)| (key, value))
-            else {
+            let Some((&victim, _)) = self.entries.iter().min_by_key(|(_, (_, used))| *used) else {
                 break;
             };
             if let Some((old, _)) = self.entries.remove(&victim) {
@@ -543,6 +540,9 @@ mod tests {
 
     #[test]
     fn rgb_expands_to_opaque_rgba() {
-        assert_eq!(rgb_to_rgba(&[1, 2, 3, 4, 5, 6]), vec![1, 2, 3, 255, 4, 5, 6, 255]);
+        assert_eq!(
+            rgb_to_rgba(&[1, 2, 3, 4, 5, 6]),
+            vec![1, 2, 3, 255, 4, 5, 6, 255]
+        );
     }
 }

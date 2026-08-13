@@ -429,6 +429,7 @@ fn client_handshake(stream: &mut UnixStream, version: u32, cols: u16, rows: u16)
     payload.extend_from_slice(&encode_varint_u32(0)); // RenderEncoding::SemanticFrame
     payload.extend_from_slice(&encode_varint_u32(0)); // ClientKeybindings::Server
     payload.extend_from_slice(&encode_varint_u32(0)); // ClientLaunchMode::App
+    payload.extend_from_slice(&encode_varint_u32(0)); // sixel_graphics: false
 
     stream
         .write_all(&frame_message(&payload))
@@ -509,6 +510,34 @@ struct FrameWire {
     cursor: Option<CursorWire>,
     hyperlinks: Vec<String>,
     graphics: Vec<u8>,
+    sixels: Vec<SixelSpliceWire>,
+    raw_osc: Vec<RawOscWire>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct SixelPaneRectWire {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct SixelSpliceWire {
+    pane_id: u32,
+    rect: SixelPaneRectWire,
+    row: u16,
+    col: u16,
+    data: Vec<u8>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct RawOscWire {
+    pane_id: u32,
+    data: Vec<u8>,
 }
 
 #[allow(dead_code)]
