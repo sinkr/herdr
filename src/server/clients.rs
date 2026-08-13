@@ -68,6 +68,10 @@ pub(crate) struct ClientConnection {
     /// True when the client's Hello declared an IIP-capable outer
     /// terminal (drives Kitty→IIP transcode and placeholder blanking).
     pub(crate) iip_graphics: bool,
+    /// True when the client's Hello declared it a geometry-passive viewer:
+    /// it is never selected as the foreground client, so its terminal
+    /// geometry never drives pane sizing.
+    pub(crate) geometry_passive: bool,
     /// Per-pane watermark of the highest Sixel emission sequence sent to
     /// this client. Emissions at or below the watermark are never re-sent.
     pub(crate) sixel_watermarks: HashMap<crate::layout::PaneId, u64>,
@@ -152,6 +156,7 @@ impl ClientConnection {
             sixel_graphics: false,
             iip_transcode: crate::kitty_graphics::SixelTranscodeCache::default(),
             iip_graphics: false,
+            geometry_passive: false,
             sixel_watermarks: HashMap::new(),
             osc_watermarks: HashMap::new(),
             direct_graphics: false,
@@ -309,10 +314,14 @@ pub(crate) fn events_include_interaction(events: &[crate::raw_input::RawInputEve
     })
 }
 
+/// Picks the most recently active full-app client eligible to become the
+/// foreground client. Geometry-passive viewers are never eligible: when only
+/// passive clients remain, the foreground drops to `None` and the effective
+/// size falls back to the minimum instead of a viewer's geometry.
 pub(crate) fn latest_app_client(clients: &HashMap<u64, ClientConnection>) -> Option<u64> {
     clients
         .iter()
-        .filter(|(_, client)| client.is_full_app_client())
+        .filter(|(_, client)| client.is_full_app_client() && !client.geometry_passive)
         .max_by_key(|(_, client)| client.last_activity)
         .map(|(&client_id, _)| client_id)
 }

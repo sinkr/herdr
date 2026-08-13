@@ -706,7 +706,12 @@ impl HeadlessServer {
                 needs_graphics_render = false;
             }
 
-            if latest_app_client(&self.clients).is_some() && self.app.ensure_default_workspace() {
+            if self
+                .clients
+                .values()
+                .any(ClientConnection::is_full_app_client)
+                && self.app.ensure_default_workspace()
+            {
                 needs_render = true;
                 needs_full_render = true;
                 needs_graphics_render = false;
@@ -1586,6 +1591,13 @@ impl HeadlessServer {
             return false;
         };
         client.last_activity = stamp;
+
+        // Geometry-passive viewers never become the foreground client: their
+        // terminal geometry must not drive pane sizing, so their input and
+        // resizes leave the current foreground (and effective size) alone.
+        if client.geometry_passive {
+            return false;
+        }
 
         let changed = self.foreground_client_id != Some(client_id);
         self.foreground_client_id = Some(client_id);
@@ -3034,6 +3046,7 @@ impl HeadlessServer {
                 direct_graphics,
                 sixel_graphics,
                 iip_graphics,
+                geometry_passive,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -3058,6 +3071,7 @@ impl HeadlessServer {
                     ?render_encoding,
                     sixel_graphics,
                     iip_graphics,
+                    geometry_passive,
                     "client connected"
                 );
                 let last_activity = self.allocate_activity_stamp();
@@ -3080,8 +3094,9 @@ impl HeadlessServer {
                 connection.pixel_mouse = direct_graphics;
                 connection.sixel_graphics = sixel_graphics;
                 connection.iip_graphics = iip_graphics;
+                connection.geometry_passive = geometry_passive;
                 self.clients.insert(client_id, connection);
-                if !direct_attach_requested {
+                if !direct_attach_requested && !geometry_passive {
                     self.foreground_client_id = Some(client_id);
                 }
                 if first_app_client {
@@ -6930,6 +6945,7 @@ mod tests {
             direct_graphics: true,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer: writer_a,
         }));
         assert!(server.clients[&1].direct_graphics);
@@ -6949,6 +6965,7 @@ mod tests {
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer: writer_b,
         }));
         assert!(!server.direct_graphics_available());
@@ -6981,6 +6998,7 @@ new_tab = "prefix+t"
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer: writer_a,
         }));
         assert_eq!(
@@ -7008,6 +7026,7 @@ new_tab = "prefix+t"
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -7051,6 +7070,7 @@ new_tab = "prefix+t"
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer: writer_a,
         }));
         assert_eq!(server.app.state.config_diagnostic, without_keybindings);
@@ -7067,6 +7087,7 @@ new_tab = "prefix+t"
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -7113,6 +7134,7 @@ next_tab = ""
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -7191,6 +7213,7 @@ next_tab = ""
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer: writer_a,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -7214,6 +7237,7 @@ next_tab = ""
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -7251,6 +7275,7 @@ next_tab = ""
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer,
         }));
         assert!(server.clients.contains_key(&7));
@@ -7319,6 +7344,7 @@ next_tab = ""
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer,
         }));
         control_rx
@@ -7735,6 +7761,7 @@ next_tab = ""
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer,
         }));
 
@@ -7772,6 +7799,7 @@ next_tab = ""
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer,
         }));
 
@@ -7808,6 +7836,7 @@ next_tab = ""
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer,
         }));
         assert!(server.has_app_client());
@@ -7911,6 +7940,7 @@ next_tab = ""
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer,
         }));
         assert!(
@@ -9526,6 +9556,108 @@ next_tab = ""
         )
     }
 
+    /// A geometry-passive viewer attaching must not become the foreground
+    /// client: the effective size stays pinned to the primary client's
+    /// geometry instead of reflowing every pane PTY to the viewer's.
+    #[tokio::test]
+    async fn geometry_passive_client_attach_leaves_effective_size_untouched() {
+        let mut server = test_headless_server();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (120, 40),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        assert_eq!(server.effective_size, (120, 40));
+
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 2,
+            cols: 165,
+            rows: 45,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            direct_graphics: false,
+            sixel_graphics: false,
+            iip_graphics: false,
+            geometry_passive: true,
+            writer,
+        }));
+
+        assert!(server.clients[&2].geometry_passive);
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.effective_size, (120, 40));
+    }
+
+    /// Input from a geometry-passive viewer still reaches the focused pane
+    /// but never promotes the viewer to foreground (which would resize the
+    /// shared runtime to the viewer's geometry).
+    #[tokio::test]
+    async fn geometry_passive_client_input_routes_without_grabbing_foreground() {
+        let mut server = test_headless_server();
+        let mut input_rx = install_focused_test_runtime(&mut server, b"");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        let mut passive = test_app_client(Some(true), 2);
+        passive.geometry_passive = true;
+        server.clients.insert(2, passive);
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        let _ = server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 2,
+            data: b"x".to_vec(),
+        });
+
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("passive client input reaches the pane"),
+            Bytes::from_static(b"x")
+        );
+    }
+
+    /// When the sole normal client disconnects while a geometry-passive
+    /// viewer remains, the foreground falls back to `None` (minimum
+    /// effective size), never to the passive viewer — even when the viewer
+    /// has the most recent activity stamp.
+    #[tokio::test]
+    async fn sole_normal_client_disconnect_never_promotes_passive_client() {
+        let mut server = test_headless_server();
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        let mut passive = ClientConnection::new(
+            (165, 45),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            99,
+            RenderEncoding::SemanticFrame,
+            None,
+        );
+        passive.geometry_passive = true;
+        server.clients.insert(2, passive);
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 1 }));
+
+        assert!(server.clients.contains_key(&2));
+        assert_eq!(server.foreground_client_id, None);
+        assert_eq!(server.effective_size, (MIN_COLS, MIN_ROWS));
+    }
+
     #[test]
     fn foreground_client_focus_event_updates_app_focus_state() {
         let mut server = test_headless_server();
@@ -9964,6 +10096,7 @@ next_tab = ""
             direct_graphics: false,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
             writer,
         }));
         assert!(

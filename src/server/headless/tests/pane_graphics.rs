@@ -320,6 +320,7 @@ fn direct_eligibility_is_installed_with_the_client_connection() {
         direct_graphics: true,
         sixel_graphics: false,
         iip_graphics: false,
+        geometry_passive: false,
         writer,
     }));
 

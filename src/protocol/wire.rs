@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 /// outer terminal renders Sixel (drives server-side Kitty→Sixel transcode).
 /// v24: `Hello` carries `iip_graphics`, the client's declaration that its
 /// outer terminal renders iTerm2 inline images (OSC 1337 IIP).
-pub const PROTOCOL_VERSION: u32 = 24;
+/// v25: `Hello` carries `geometry_passive`, the client's declaration that it
+/// is a viewer whose terminal geometry must never drive pane sizing.
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -372,6 +374,10 @@ pub enum ClientMessage {
         /// (OSC 1337 IIP) and the client wants Kitty placements transcoded
         /// into IIP splices.
         iip_graphics: bool,
+        /// True when this client is a passive viewer: it must never become
+        /// the foreground client, so its terminal geometry never drives the
+        /// effective size used to resize pane PTYs.
+        geometry_passive: bool,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -1116,6 +1122,7 @@ mod tests {
             launch_mode: ClientLaunchMode::App,
             sixel_graphics: true,
             iip_graphics: false,
+            geometry_passive: false,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1124,8 +1131,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_24_for_iip_capability_hello() {
-        assert_eq!(PROTOCOL_VERSION, 24);
+    fn protocol_version_is_25_for_geometry_passive_hello() {
+        assert_eq!(PROTOCOL_VERSION, 25);
     }
 
     #[test]
@@ -1160,6 +1167,7 @@ mod tests {
                 launch_mode: ClientLaunchMode::App,
                 sixel_graphics: false,
                 iip_graphics: false,
+                geometry_passive: false,
             }),
             0
         );
@@ -1770,6 +1778,7 @@ mod tests {
             launch_mode: ClientLaunchMode::App,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1850,6 +1859,7 @@ mod tests {
                     launch_mode: ClientLaunchMode::App,
                     sixel_graphics: (i % 2) == 0,
                     iip_graphics: (i % 3) == 0,
+                    geometry_passive: (i % 5) == 0,
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -2288,6 +2298,7 @@ mod tests {
             launch_mode: ClientLaunchMode::App,
             sixel_graphics: false,
             iip_graphics: false,
+            geometry_passive: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2326,6 +2337,7 @@ mod tests {
                 launch_mode: ClientLaunchMode::App,
                 sixel_graphics: false,
                 iip_graphics: false,
+                geometry_passive: false,
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),

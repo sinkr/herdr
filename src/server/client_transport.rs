@@ -318,6 +318,7 @@ pub(crate) enum ServerEvent {
         direct_graphics: bool,
         sixel_graphics: bool,
         iip_graphics: bool,
+        geometry_passive: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -567,6 +568,7 @@ pub(crate) fn handle_client_handshake(
         direct_graphics,
         sixel_graphics,
         iip_graphics,
+        geometry_passive,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -579,6 +581,7 @@ pub(crate) fn handle_client_handshake(
             launch_mode,
             sixel_graphics,
             iip_graphics,
+            geometry_passive,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -621,6 +624,7 @@ pub(crate) fn handle_client_handshake(
                 launch_mode == ClientLaunchMode::AppDirectGraphics,
                 sixel_graphics,
                 iip_graphics,
+                geometry_passive,
             )
         }
         _ => {
@@ -687,6 +691,7 @@ pub(crate) fn handle_client_handshake(
         direct_graphics,
         sixel_graphics,
         iip_graphics,
+        geometry_passive,
         writer,
     };
     if let Err(err) = server_event_tx.blocking_send(connected) {
@@ -1349,6 +1354,7 @@ new_tab = "ctrl+notakey"
                 launch_mode: ClientLaunchMode::App,
                 sixel_graphics: true,
                 iip_graphics: true,
+                geometry_passive: true,
             },
         )
         .expect("write hello");
@@ -1384,6 +1390,7 @@ new_tab = "ctrl+notakey"
                 direct_graphics,
                 sixel_graphics,
                 iip_graphics,
+                geometry_passive,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -1395,6 +1402,7 @@ new_tab = "ctrl+notakey"
                 assert!(!direct_graphics);
                 assert!(sixel_graphics);
                 assert!(iip_graphics);
+                assert!(geometry_passive);
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
@@ -1432,6 +1440,7 @@ new_tab = "ctrl+notakey"
                 launch_mode: ClientLaunchMode::TerminalAttach,
                 sixel_graphics: false,
                 iip_graphics: false,
+                geometry_passive: false,
             },
         )
         .expect("write hello");

@@ -842,6 +842,7 @@ fn do_handshake(
     direct_attach_requested: bool,
     sixel_graphics: bool,
     iip_graphics: bool,
+    geometry_passive: bool,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
@@ -864,6 +865,7 @@ fn do_handshake(
         ),
         sixel_graphics,
         iip_graphics,
+        geometry_passive,
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -1044,6 +1046,7 @@ fn connect_terminal_session_stream(
         false,
         RenderEncoding::TerminalAnsi,
         true,
+        false,
         false,
         false,
     ) {
@@ -1272,6 +1275,7 @@ fn run_client_with_mode(
     let sixel_graphics =
         !direct_attach_requested && sixel_graphics_capability(kitty_graphics_enabled);
     let iip_graphics = !direct_attach_requested && iip_graphics_capability();
+    let geometry_passive = geometry_passive_capability();
 
     // Perform handshake while the stream is still in blocking mode.
     let negotiated_encoding = match do_handshake(
@@ -1285,6 +1289,7 @@ fn run_client_with_mode(
         direct_attach_requested,
         sixel_graphics,
         iip_graphics,
+        geometry_passive,
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
@@ -2752,6 +2757,19 @@ fn iip_graphics_capability() -> bool {
     )
 }
 
+/// Environment opt-in for the geometry-passive viewer mode declared in
+/// Hello: `1` marks this client as a passive viewer that never becomes the
+/// foreground client and never drives pane sizing. Env-only, no probe.
+const VIEWER_ENV_VAR: &str = "HERDR_VIEWER";
+
+/// Resolves the `geometry_passive` value for this client's Hello.
+///
+/// `HERDR_VIEWER=1` opts in; anything else (including unset) is a normal
+/// foreground-eligible client.
+fn geometry_passive_capability() -> bool {
+    matches!(std::env::var(VIEWER_ENV_VAR).ok().as_deref(), Some("1"))
+}
+
 /// Parses an accumulated DA1 reply (`ESC [ ? Ps ; ... c`).
 ///
 /// Returns `Some(true)` when the attribute list contains `4` (Sixel),
@@ -3016,6 +3034,24 @@ mod tests {
             let _unset = EnvVarsRemovedGuard::new(&[FORCE_IIP_ENV_VAR]);
             // No probe: without the override the capability is off.
             assert!(!iip_graphics_capability());
+        }
+    }
+
+    #[test]
+    fn viewer_env_opts_into_geometry_passive() {
+        let _lock = env_lock().lock().unwrap();
+        {
+            let _viewer = EnvVarGuard::set(VIEWER_ENV_VAR, "1");
+            assert!(geometry_passive_capability(), "=1 opts in");
+        }
+        {
+            let _off = EnvVarGuard::set(VIEWER_ENV_VAR, "0");
+            assert!(!geometry_passive_capability(), "=0 stays normal");
+        }
+        {
+            let _unset = EnvVarsRemovedGuard::new(&[VIEWER_ENV_VAR]);
+            // No probe: without the opt-in the client is a normal client.
+            assert!(!geometry_passive_capability());
         }
     }
 
