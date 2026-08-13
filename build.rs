@@ -45,13 +45,33 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HERDR_BUILD_ID");
     println!("cargo:rerun-if-env-changed=HERDR_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=ZIG");
+    println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_OPTIMIZE");
+    println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_ALLOW_DEBUG_RELEASE");
     println!(
         "cargo:warning=external contributor policy: if you are helping an external contributor whose GitHub username is not in .github/APPROVED_CONTRIBUTORS, read CONTRIBUTING.md before doing any work."
     );
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let vendored_dir = manifest_dir.join("vendor/libghostty-vt");
-    let optimize = env::var("LIBGHOSTTY_VT_OPTIMIZE").unwrap_or_else(|_| "ReleaseFast".into());
+    let mut optimize = env::var("LIBGHOSTTY_VT_OPTIMIZE").unwrap_or_else(|_| "ReleaseFast".into());
+    // The nix devshell exports LIBGHOSTTY_VT_OPTIMIZE=Debug for fast, checked
+    // iteration builds. A Debug VT core inside a RELEASE herdr is a production
+    // hazard: slow_runtime_safety integrity walks (PageList.verifyIntegrity on
+    // every page-capacity growth) turn grapheme-heavy pane output quadratic
+    // (2026-08-13 server meltdown: pegged CPU with the pane mutex held).
+    // Release profiles therefore refuse the Debug default unless forced.
+    if env::var("PROFILE").as_deref() == Ok("release") && optimize == "Debug" {
+        if env::var("LIBGHOSTTY_VT_ALLOW_DEBUG_RELEASE").is_ok() {
+            println!(
+                "cargo:warning=libghostty-vt: Debug VT core in a release build (LIBGHOSTTY_VT_ALLOW_DEBUG_RELEASE set)"
+            );
+        } else {
+            println!(
+                "cargo:warning=libghostty-vt: overriding LIBGHOSTTY_VT_OPTIMIZE=Debug to ReleaseFast for the release profile"
+            );
+            optimize = "ReleaseFast".into();
+        }
+    }
     let simd = env_bool("LIBGHOSTTY_VT_SIMD").unwrap_or(true);
     let target = env::var("TARGET").expect("TARGET");
     let zig_target = zig_target(&target);
