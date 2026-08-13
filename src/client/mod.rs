@@ -1722,10 +1722,8 @@ async fn run_client_loop(
                     } else {
                         &[]
                     };
-                    let mut splice_bytes = encode_sixel_splices(
-                        &sixels,
-                        (frame_data.width, frame_data.height),
-                    );
+                    let mut splice_bytes =
+                        encode_sixel_splices(&sixels, (frame_data.width, frame_data.height));
                     // Raw OSC passthrough records are written verbatim after
                     // the positioned sixel splices: no positioning, no
                     // wrapping, same writer and flush as the frame paint.
@@ -2959,10 +2957,7 @@ mod tests {
         assert_eq!(parse_da1_sixel_reply(b"\x1b[?63;40c"), Some(false));
         // Unrelated bytes and CSI ? sequences before the reply are skipped.
         assert_eq!(parse_da1_sixel_reply(b"xx\x1b[?62;4c"), Some(true));
-        assert_eq!(
-            parse_da1_sixel_reply(b"\x1b[?1049h\x1b[?63;4c"),
-            Some(true)
-        );
+        assert_eq!(parse_da1_sixel_reply(b"\x1b[?1049h\x1b[?63;4c"), Some(true));
     }
 
     #[test]

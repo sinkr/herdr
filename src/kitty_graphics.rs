@@ -696,8 +696,8 @@ pub(crate) fn collect_pane_sixel_transcodes(
         .collect();
     let mut prepared: HashMap<u64, Option<PreparedImage>> = HashMap::new();
     if !needed.is_empty() {
-        for placement in
-            runtime.kitty_image_placements_with_data_filter(|d| needed.contains(&d.data_fingerprint))
+        for placement in runtime
+            .kitty_image_placements_with_data_filter(|d| needed.contains(&d.data_fingerprint))
         {
             if placement.data.is_empty() {
                 continue;

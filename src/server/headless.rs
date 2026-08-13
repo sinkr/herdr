@@ -4325,9 +4325,8 @@ impl HeadlessServer {
         // Dirty patches splice into the client's retained frame, so they
         // must blank placeholder glyphs exactly like this client's full
         // renders do.
-        let _placeholder_scope = crate::kitty_graphics::hide_placeholders_for_render(
-            client.hide_kitty_placeholders(),
-        );
+        let _placeholder_scope =
+            crate::kitty_graphics::hide_placeholders_for_render(client.hide_kitty_placeholders());
         let mut touched = false;
         for info in pane_infos {
             if !rect_fits_frame(info.inner_rect, &frame) {
@@ -4345,11 +4344,7 @@ impl HeadlessServer {
             // records for SemanticFrame clients); fall back so they are
             // delivered promptly.
             if runtime.has_pending_sixels_after(
-                client
-                    .sixel_watermarks
-                    .get(&info.id)
-                    .copied()
-                    .unwrap_or(0),
+                client.sixel_watermarks.get(&info.id).copied().unwrap_or(0),
             ) {
                 retained_fallback!("pending_sixel");
             }
@@ -4689,7 +4684,10 @@ impl HeadlessServer {
         cell_size: crate::kitty_graphics::HostCellSize,
         used_bytes: &mut usize,
         sixel_splices: &mut Vec<protocol::SixelSplice>,
-    ) -> Vec<(crate::layout::PaneId, crate::kitty_graphics::PaneTranscodeState)> {
+    ) -> Vec<(
+        crate::layout::PaneId,
+        crate::kitty_graphics::PaneTranscodeState,
+    )> {
         let mut commits = Vec::new();
         match mode {
             ClientConnectionMode::App => {
@@ -4918,13 +4916,11 @@ impl HeadlessServer {
                                     .osc_watermarks
                                     .get(&info.id)
                                     .copied();
-                                let Some(runtime) =
-                                    self.app.state.runtime_for_pane_in_workspace(
-                                        &self.app.terminal_runtimes,
-                                        ws_idx,
-                                        info.id,
-                                    )
-                                else {
+                                let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
+                                    &self.app.terminal_runtimes,
+                                    ws_idx,
+                                    info.id,
+                                ) else {
                                     continue;
                                 };
                                 let outcome = Self::collect_client_pane_sixels(
@@ -4993,12 +4989,7 @@ impl HeadlessServer {
                         collected = Some((pane_id, outcome, osc_outcome));
                     }
                     if let Some((pane_id, outcome, osc_outcome)) = collected {
-                        self.record_sixel_outcome(
-                            client_id,
-                            pane_id,
-                            outcome,
-                            &mut sixel_commits,
-                        );
+                        self.record_sixel_outcome(client_id, pane_id, outcome, &mut sixel_commits);
                         self.record_raw_osc_outcome(
                             client_id,
                             pane_id,
@@ -5015,9 +5006,8 @@ impl HeadlessServer {
             // client's snapshot, and ride encoded splices on this frame.
             // Replacement state commits only on send success (or on a
             // skip-identical pass, which implies no splices were pending).
-            let native_kitty_path = is_app_client
-                && self.app.state.kitty_graphics_enabled
-                && cell_size.is_known();
+            let native_kitty_path =
+                is_app_client && self.app.state.kitty_graphics_enabled && cell_size.is_known();
             let sixel_transcode_client = self
                 .clients
                 .get(&client_id)
@@ -5914,8 +5904,7 @@ mod tests {
 
         // Timestamps alone collide when parallel test threads start within
         // the clock's resolution; a per-process sequence keeps paths unique.
-        static TEST_SOCKET_SEQ: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static TEST_SOCKET_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "hh-{}-{}-{}",
             std::process::id(),
@@ -10486,10 +10475,7 @@ next_tab = ""
                 .expect("initial frame"),
         );
         assert!(sixels.is_empty());
-        assert_eq!(
-            server.clients[&1].sixel_watermarks.get(&pane_id),
-            Some(&0)
-        );
+        assert_eq!(server.clients[&1].sixel_watermarks.get(&pane_id), Some(&0));
 
         let runtime = server
             .app
@@ -10522,10 +10508,7 @@ next_tab = ""
         // Cursor sat after "hello" when the DCS was dispatched.
         assert_eq!((sixels[0].row, sixels[0].col), (0, 5));
         assert_eq!(sixels[0].data, SEMANTIC_SIXEL);
-        assert_eq!(
-            server.clients[&1].sixel_watermarks.get(&pane_id),
-            Some(&1)
-        );
+        assert_eq!(server.clients[&1].sixel_watermarks.get(&pane_id), Some(&1));
 
         // Later frames never replay the delivered emission.
         let runtime = server
@@ -10569,10 +10552,7 @@ next_tab = ""
             .unwrap()
             .test_fill_render(queued);
         server.render_and_stream();
-        assert_eq!(
-            server.clients[&1].sixel_watermarks.get(&pane_id),
-            Some(&0)
-        );
+        assert_eq!(server.clients[&1].sixel_watermarks.get(&pane_id), Some(&0));
 
         // Drain the queue; the next frame re-delivers the splice and only
         // then commits the watermark.
@@ -10588,10 +10568,7 @@ next_tab = ""
         );
         assert_eq!(sixels.len(), 1);
         assert_eq!(sixels[0].data, SEMANTIC_SIXEL);
-        assert_eq!(
-            server.clients[&1].sixel_watermarks.get(&pane_id),
-            Some(&1)
-        );
+        assert_eq!(server.clients[&1].sixel_watermarks.get(&pane_id), Some(&1));
     }
 
     #[tokio::test]
@@ -10609,10 +10586,7 @@ next_tab = ""
             .unwrap()
             .test_fill_render(queued);
         server.render_and_stream();
-        assert_eq!(
-            server.clients[&1].sixel_watermarks.get(&pane_id),
-            Some(&0)
-        );
+        assert_eq!(server.clients[&1].sixel_watermarks.get(&pane_id), Some(&0));
 
         let runtime = server
             .app
@@ -10633,10 +10607,7 @@ next_tab = ""
         );
         assert_eq!(sixels.len(), 1, "emission after first sight must deliver");
         assert_eq!(sixels[0].data, SEMANTIC_SIXEL);
-        assert_eq!(
-            server.clients[&1].sixel_watermarks.get(&pane_id),
-            Some(&1)
-        );
+        assert_eq!(server.clients[&1].sixel_watermarks.get(&pane_id), Some(&1));
     }
 
     /// Kitty APC bytes creating a 2×1-cell Unicode-placeholder virtual

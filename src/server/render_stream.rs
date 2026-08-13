@@ -89,16 +89,12 @@ impl ClientRenderState {
     ) -> Option<PreparedRender> {
         match self {
             Self::Semantic { last_frame } => {
-                if splices.is_empty() && raw_osc.is_empty() && last_frame.as_ref() == Some(&frame)
-                {
+                if splices.is_empty() && raw_osc.is_empty() && last_frame.as_ref() == Some(&frame) {
                     crate::render_prof::event("prepare_frame.semantic.skip_current");
                     return None;
                 }
                 crate::render_prof::event("prepare_frame.semantic.changed");
-                crate::render_prof::counter(
-                    "prepare_frame.sixel.splices",
-                    splices.len() as u64,
-                );
+                crate::render_prof::counter("prepare_frame.sixel.splices", splices.len() as u64);
                 crate::render_prof::counter("prepare_frame.raw_osc.records", raw_osc.len() as u64);
                 Some(PreparedRender::Semantic {
                     message: ServerMessage::Frame {
