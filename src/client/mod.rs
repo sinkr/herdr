@@ -841,6 +841,7 @@ fn do_handshake(
     requested_encoding: RenderEncoding,
     direct_attach_requested: bool,
     sixel_graphics: bool,
+    iip_graphics: bool,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
@@ -862,6 +863,7 @@ fn do_handshake(
             cell_height_px,
         ),
         sixel_graphics,
+        iip_graphics,
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -1042,6 +1044,7 @@ fn connect_terminal_session_stream(
         false,
         RenderEncoding::TerminalAnsi,
         true,
+        false,
         false,
     ) {
         Ok(RenderEncoding::TerminalAnsi) => {}
@@ -1268,6 +1271,7 @@ fn run_client_with_mode(
     // the probe manages raw mode itself and must not race the client loop.
     let sixel_graphics =
         !direct_attach_requested && sixel_graphics_capability(kitty_graphics_enabled);
+    let iip_graphics = !direct_attach_requested && iip_graphics_capability();
 
     // Perform handshake while the stream is still in blocking mode.
     let negotiated_encoding = match do_handshake(
@@ -1280,6 +1284,7 @@ fn run_client_with_mode(
         requested_encoding,
         direct_attach_requested,
         sixel_graphics,
+        iip_graphics,
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
@@ -2731,6 +2736,22 @@ fn sixel_graphics_capability(kitty_graphics_enabled: bool) -> bool {
     probe_outer_terminal_sixel()
 }
 
+/// Environment override for the IIP capability declared in Hello:
+/// `1` forces it on, `0` forces it off. There is no probe — IIP support
+/// is not discoverable via DA1, so the capability defaults to off.
+const FORCE_IIP_ENV_VAR: &str = "HERDR_FORCE_IIP";
+
+/// Resolves the `iip_graphics` value for this client's Hello.
+///
+/// `HERDR_FORCE_IIP=1`/`0` wins outright; without the override the
+/// capability is off (env-only, no probe).
+fn iip_graphics_capability() -> bool {
+    matches!(
+        std::env::var(FORCE_IIP_ENV_VAR).ok().as_deref(),
+        Some("1")
+    )
+}
+
 /// Parses an accumulated DA1 reply (`ESC [ ? Ps ; ... c`).
 ///
 /// Returns `Some(true)` when the attribute list contains `4` (Sixel),
@@ -2977,6 +2998,24 @@ mod tests {
             // Kitty-enabled clients never probe: the native replay path
             // takes precedence.
             assert!(!sixel_graphics_capability(true));
+        }
+    }
+
+    #[test]
+    fn force_iip_env_overrides_capability() {
+        let _lock = env_lock().lock().unwrap();
+        {
+            let _force_on = EnvVarGuard::set(FORCE_IIP_ENV_VAR, "1");
+            assert!(iip_graphics_capability(), "=1 forces on");
+        }
+        {
+            let _force_off = EnvVarGuard::set(FORCE_IIP_ENV_VAR, "0");
+            assert!(!iip_graphics_capability(), "=0 forces off");
+        }
+        {
+            let _unset = EnvVarsRemovedGuard::new(&[FORCE_IIP_ENV_VAR]);
+            // No probe: without the override the capability is off.
+            assert!(!iip_graphics_capability());
         }
     }
 

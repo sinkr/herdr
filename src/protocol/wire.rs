@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 /// and one-shot raw OSC 5522 passthrough records (`raw_osc`).
 /// v23: `Hello` carries `sixel_graphics`, the client's declaration that its
 /// outer terminal renders Sixel (drives server-side Kitty→Sixel transcode).
-pub const PROTOCOL_VERSION: u32 = 23;
+/// v24: `Hello` carries `iip_graphics`, the client's declaration that its
+/// outer terminal renders iTerm2 inline images (OSC 1337 IIP).
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -366,6 +368,10 @@ pub enum ClientMessage {
         /// True when the client's outer terminal renders Sixel graphics and
         /// the client wants Kitty placements transcoded into Sixel splices.
         sixel_graphics: bool,
+        /// True when the client's outer terminal renders iTerm2 inline images
+        /// (OSC 1337 IIP) and the client wants Kitty placements transcoded
+        /// into IIP splices.
+        iip_graphics: bool,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -1109,6 +1115,7 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
             sixel_graphics: true,
+            iip_graphics: false,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1117,8 +1124,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_23_for_sixel_capability_hello() {
-        assert_eq!(PROTOCOL_VERSION, 23);
+    fn protocol_version_is_24_for_iip_capability_hello() {
+        assert_eq!(PROTOCOL_VERSION, 24);
     }
 
     #[test]
@@ -1152,6 +1159,7 @@ mod tests {
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
                 sixel_graphics: false,
+                iip_graphics: false,
             }),
             0
         );
@@ -1761,6 +1769,7 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
             sixel_graphics: false,
+            iip_graphics: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1840,6 +1849,7 @@ mod tests {
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::App,
                     sixel_graphics: (i % 2) == 0,
+                    iip_graphics: (i % 3) == 0,
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -2277,6 +2287,7 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
             sixel_graphics: false,
+            iip_graphics: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2314,6 +2325,7 @@ mod tests {
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
                 sixel_graphics: false,
+                iip_graphics: false,
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),

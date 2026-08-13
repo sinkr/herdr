@@ -530,6 +530,7 @@ fn client_handshake(
             &encode_varint_u32(0),  // ClientKeybindings::Server
             &encode_varint_u32(0),  // ClientLaunchMode::App
             &encode_varint_u32(0),  // sixel_graphics: false
+            &encode_varint_u32(0),  // iip_graphics: false
         ],
     );
     stream

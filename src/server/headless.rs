@@ -331,6 +331,11 @@ pub struct HeadlessServer {
     /// Shared cache of encoded Sixel emissions for Kitty→Sixel transcode,
     /// reused across all Sixel-declaring clients.
     sixel_encode_cache: crate::sixel_encode::SixelEncodeCache,
+    /// Shared cache of encoded IIP emissions for Kitty→IIP transcode,
+    /// reused across all IIP-declaring clients. Separate from
+    /// `sixel_encode_cache`: the same key encodes to different bytes per
+    /// output format.
+    iip_encode_cache: crate::sixel_encode::SixelEncodeCache,
     /// Deferred application-history reads currently driving alternate-screen viewports.
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
     /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
@@ -539,6 +544,7 @@ impl HeadlessServer {
             server_config_diagnostic_without_keybindings,
             terminal_attach_owners: HashMap::new(),
             sixel_encode_cache: crate::sixel_encode::SixelEncodeCache::default(),
+            iip_encode_cache: crate::sixel_encode::SixelEncodeCache::default(),
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
@@ -3027,6 +3033,7 @@ impl HeadlessServer {
                 direct_attach_requested,
                 direct_graphics,
                 sixel_graphics,
+                iip_graphics,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -3050,6 +3057,7 @@ impl HeadlessServer {
                     cell_height_px,
                     ?render_encoding,
                     sixel_graphics,
+                    iip_graphics,
                     "client connected"
                 );
                 let last_activity = self.allocate_activity_stamp();
@@ -3071,6 +3079,7 @@ impl HeadlessServer {
                 connection.direct_graphics = direct_graphics;
                 connection.pixel_mouse = direct_graphics;
                 connection.sixel_graphics = sixel_graphics;
+                connection.iip_graphics = iip_graphics;
                 self.clients.insert(client_id, connection);
                 if !direct_attach_requested {
                     self.foreground_client_id = Some(client_id);
@@ -4306,6 +4315,19 @@ impl HeadlessServer {
                 retained_fallback!("visible_sixel_transcode");
             }
         }
+        // IIP transcode shares the same retained-render obligations.
+        if client.iip_transcode_active() {
+            if !client.iip_transcode.is_empty() {
+                retained_fallback!("iip_transcode_state_active");
+            }
+            if crate::kitty_graphics::has_visible_terminal_kitty_placements(
+                &self.app.state,
+                &self.app.terminal_runtimes,
+                self.app.state.view.tab_surface(),
+            ) {
+                retained_fallback!("visible_iip_transcode");
+            }
+        }
         let Some(mut frame) = client.render_state.last_frame().cloned() else {
             retained_fallback!("no_last_frame");
         };
@@ -4752,6 +4774,87 @@ impl HeadlessServer {
         commits
     }
 
+    /// Gathers Kitty→IIP transcode splices for one client's frame pass.
+    ///
+    /// Sibling of [`collect_client_sixel_transcodes`] over the client's
+    /// IIP transcode snapshot and the server's IIP encode cache; the same
+    /// commit discipline applies.
+    fn collect_client_iip_transcodes(
+        &mut self,
+        client_id: u64,
+        mode: &ClientConnectionMode,
+        client_area: Rect,
+        cell_size: crate::kitty_graphics::HostCellSize,
+        used_bytes: &mut usize,
+        sixel_splices: &mut Vec<protocol::SixelSplice>,
+    ) -> Vec<(
+        crate::layout::PaneId,
+        crate::kitty_graphics::PaneTranscodeState,
+    )> {
+        let mut commits = Vec::new();
+        match mode {
+            ClientConnectionMode::App => {
+                if self.app.state.mode != app::Mode::Terminal {
+                    return commits;
+                }
+                let Some(ws_idx) = self.app.state.active else {
+                    return commits;
+                };
+                let pane_infos = self.app.state.view.pane_infos.clone();
+                let Some(client) = self.clients.get(&client_id) else {
+                    return commits;
+                };
+                for info in &pane_infos {
+                    let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
+                        &self.app.terminal_runtimes,
+                        ws_idx,
+                        info.id,
+                    ) else {
+                        continue;
+                    };
+                    let outcome = crate::kitty_graphics::collect_pane_iip_transcodes(
+                        runtime,
+                        info.id,
+                        info.inner_rect,
+                        cell_size,
+                        Some(&client.iip_transcode),
+                        &mut self.iip_encode_cache,
+                        used_bytes,
+                        Self::SIXEL_FRAME_BUDGET,
+                    );
+                    sixel_splices.extend(outcome.splices);
+                    commits.push((info.id, outcome.state));
+                }
+            }
+            ClientConnectionMode::TerminalAttach { terminal_id }
+            | ClientConnectionMode::TerminalObserve { terminal_id } => {
+                let Some(terminal_id) = self.terminal_id_by_string(terminal_id) else {
+                    return commits;
+                };
+                let Some(runtime) = self.app.terminal_runtimes.get(&terminal_id) else {
+                    return commits;
+                };
+                let Some(client) = self.clients.get(&client_id) else {
+                    return commits;
+                };
+                let pane_id = runtime.pane_id();
+                let outcome = crate::kitty_graphics::collect_pane_iip_transcodes(
+                    runtime,
+                    pane_id,
+                    client_area,
+                    cell_size,
+                    Some(&client.iip_transcode),
+                    &mut self.iip_encode_cache,
+                    used_bytes,
+                    Self::SIXEL_FRAME_BUDGET,
+                );
+                sixel_splices.extend(outcome.splices);
+                commits.push((pane_id, outcome.state));
+            }
+        }
+        commits
+    }
+
     fn render_and_stream(&mut self) {
         let full_started = crate::render_prof::timer();
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
@@ -5000,10 +5103,11 @@ impl HeadlessServer {
                 }
             }
 
-            // Kitty→Sixel transcode for Sixel-declaring SemanticFrame
-            // clients outside the native Kitty replay path: walk the same
-            // panes the frame rendered, diff placement state against the
-            // client's snapshot, and ride encoded splices on this frame.
+            // Kitty→Sixel/IIP transcode for graphics-declaring
+            // SemanticFrame clients outside the native Kitty replay path:
+            // walk the same panes the frame rendered, diff placement state
+            // against the client's snapshot, and ride encoded splices on
+            // this frame. IIP wins when a client declared both formats.
             // Replacement state commits only on send success (or on a
             // skip-identical pass, which implies no splices were pending).
             let native_kitty_path =
@@ -5012,11 +5116,49 @@ impl HeadlessServer {
                 .clients
                 .get(&client_id)
                 .is_some_and(ClientConnection::sixel_transcode_active);
+            let iip_transcode_client = self
+                .clients
+                .get(&client_id)
+                .is_some_and(ClientConnection::iip_transcode_active);
             let mut transcode_commits: Vec<(
                 crate::layout::PaneId,
                 crate::kitty_graphics::PaneTranscodeState,
             )> = Vec::new();
-            if sixel_transcode_client && !native_kitty_path {
+            let mut iip_transcode_commits: Vec<(
+                crate::layout::PaneId,
+                crate::kitty_graphics::PaneTranscodeState,
+            )> = Vec::new();
+            if iip_transcode_client && !native_kitty_path {
+                let mut used_bytes = sixel_bytes.len()
+                    + sixel_splices
+                        .iter()
+                        .map(|splice| splice.data.len() + Self::SIXEL_SPLICE_SLACK)
+                        .sum::<usize>();
+                iip_transcode_commits = self.collect_client_iip_transcodes(
+                    client_id,
+                    &mode,
+                    area,
+                    cell_size,
+                    &mut used_bytes,
+                    &mut sixel_splices,
+                );
+                // Panes tracked by this client but absent from this frame
+                // pass (tab switch, overlay, pane close) get their state
+                // cleared: the frame overdrew their cells, so returning
+                // placements must re-emit as additions.
+                if let Some(client) = self.clients.get(&client_id) {
+                    let visited: HashSet<crate::layout::PaneId> =
+                        iip_transcode_commits.iter().map(|(id, _)| *id).collect();
+                    for pane_id in client.iip_transcode.tracked_panes() {
+                        if !visited.contains(&pane_id) {
+                            iip_transcode_commits.push((
+                                pane_id,
+                                crate::kitty_graphics::PaneTranscodeState::default(),
+                            ));
+                        }
+                    }
+                }
+            } else if sixel_transcode_client && !native_kitty_path {
                 let mut used_bytes = sixel_bytes.len()
                     + sixel_splices
                         .iter()
@@ -5148,6 +5290,9 @@ impl HeadlessServer {
                 for (pane_id, state) in transcode_commits.drain(..) {
                     client.sixel_transcode.commit(pane_id, state);
                 }
+                for (pane_id, state) in iip_transcode_commits.drain(..) {
+                    client.iip_transcode.commit(pane_id, state);
+                }
                 crate::render_prof::event("full_render.skip_identical");
                 continue;
             };
@@ -5179,6 +5324,7 @@ impl HeadlessServer {
                     sixel_commits.clear();
                     osc_commits.clear();
                     transcode_commits.clear();
+                    iip_transcode_commits.clear();
                     let Some(text_only_prepared) =
                         client.render_state.prepare_frame(text_only_frame)
                     else {
@@ -5230,6 +5376,9 @@ impl HeadlessServer {
                     }
                     for (pane_id, state) in transcode_commits.drain(..) {
                         client.sixel_transcode.commit(pane_id, state);
+                    }
+                    for (pane_id, state) in iip_transcode_commits.drain(..) {
+                        client.iip_transcode.commit(pane_id, state);
                     }
                     if encoded.incomplete {
                         client.defer_full_render();
@@ -5959,6 +6108,7 @@ mod tests {
             server_config_diagnostic_without_keybindings: None,
             terminal_attach_owners: HashMap::new(),
             sixel_encode_cache: crate::sixel_encode::SixelEncodeCache::default(),
+            iip_encode_cache: crate::sixel_encode::SixelEncodeCache::default(),
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
@@ -6757,6 +6907,7 @@ mod tests {
             direct_attach_requested: false,
             direct_graphics: true,
             sixel_graphics: false,
+            iip_graphics: false,
             writer: writer_a,
         }));
         assert!(server.clients[&1].direct_graphics);
@@ -6775,6 +6926,7 @@ mod tests {
             direct_attach_requested: false,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer: writer_b,
         }));
         assert!(!server.direct_graphics_available());
@@ -6806,6 +6958,7 @@ new_tab = "prefix+t"
             direct_attach_requested: false,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer: writer_a,
         }));
         assert_eq!(
@@ -6832,6 +6985,7 @@ new_tab = "prefix+t"
             direct_attach_requested: false,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -6874,6 +7028,7 @@ new_tab = "prefix+t"
             direct_attach_requested: false,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer: writer_a,
         }));
         assert_eq!(server.app.state.config_diagnostic, without_keybindings);
@@ -6889,6 +7044,7 @@ new_tab = "prefix+t"
             direct_attach_requested: false,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -6934,6 +7090,7 @@ next_tab = ""
             direct_attach_requested: false,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -7011,6 +7168,7 @@ next_tab = ""
             direct_attach_requested: false,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer: writer_a,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -7033,6 +7191,7 @@ next_tab = ""
             direct_attach_requested: false,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -7069,6 +7228,7 @@ next_tab = ""
             direct_attach_requested: true,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer,
         }));
         assert!(server.clients.contains_key(&7));
@@ -7136,6 +7296,7 @@ next_tab = ""
             direct_attach_requested: true,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer,
         }));
         control_rx
@@ -7551,6 +7712,7 @@ next_tab = ""
             direct_attach_requested: false,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer,
         }));
 
@@ -7587,6 +7749,7 @@ next_tab = ""
             direct_attach_requested: true,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer,
         }));
 
@@ -7622,6 +7785,7 @@ next_tab = ""
             direct_attach_requested: false,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer,
         }));
         assert!(server.has_app_client());
@@ -7724,6 +7888,7 @@ next_tab = ""
             direct_attach_requested: true,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer,
         }));
         assert!(
@@ -9776,6 +9941,7 @@ next_tab = ""
             direct_attach_requested: true,
             direct_graphics: false,
             sixel_graphics: false,
+            iip_graphics: false,
             writer,
         }));
         assert!(
@@ -10841,6 +11007,195 @@ next_tab = ""
         assert!(
             client_rx.recv_timeout(Duration::from_millis(50)).is_err(),
             "settled placement must not re-emit"
+        );
+    }
+
+    /// A tiny valid 2×2 RGBA PNG built with the `png` crate, small enough
+    /// that the IIP passthrough branch (full-image source rect, well under
+    /// 16 Mpx) applies.
+    fn tiny_test_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 2, 2);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer
+                .write_image_data(&[
+                    0xff, 0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, //
+                    0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                ])
+                .expect("png data");
+        }
+        bytes
+    }
+
+    /// Kitty APC bytes chunk-uploading `png` as an f=100 image and placing
+    /// it as a 2×1-cell Unicode-placeholder virtual placement with
+    /// placeholder cells at pane row 1, columns 2-3 (the
+    /// [`kitty_chunked_virtual_placement`] recipe with PNG file bytes
+    /// instead of raw RGBA).
+    fn kitty_chunked_png_virtual_placement(png: &[u8]) -> Vec<u8> {
+        use base64::Engine as _;
+        use std::io::Write as _;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+        let mut bytes = Vec::with_capacity(encoded.len() + encoded.len() / 4096 * 32 + 256);
+        let chunks = encoded.as_bytes().chunks(4096);
+        let last_index = chunks.len() - 1;
+        for (index, chunk) in chunks.enumerate() {
+            let more = if index == last_index { 0 } else { 1 };
+            if index == 0 {
+                let _ = write!(bytes, "\x1b_Gq=2,a=t,t=d,f=100,i=1193046,m={more};");
+            } else {
+                let _ = write!(bytes, "\x1b_Gq=2,m={more};");
+            }
+            bytes.extend_from_slice(chunk);
+            bytes.extend_from_slice(b"\x1b\\");
+        }
+        bytes.extend_from_slice(b"\x1b_Gq=2,a=p,U=1,i=1193046,c=2,r=1\x1b\\");
+        bytes.extend_from_slice(
+            "\x1b[2;3H\x1b[38;2;18;52;86m\u{10eeee}\u{0305}\u{0305}\u{10eeee}\u{0305}\u{030d}\x1b[0m"
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    /// [`sixel_transcode_test_server`] with the IIP capability bit set
+    /// instead and caller-supplied pane screen bytes (IIP tests upload a
+    /// PNG built at runtime).
+    fn iip_test_server(
+        screen_bytes: &[u8],
+    ) -> (
+        HeadlessServer,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        crate::layout::PaneId,
+    ) {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("test");
+        let pane_id = workspace.focused_pane_id().expect("focused pane");
+        workspace.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_kitty_graphics_screen_bytes(
+                80,
+                24,
+                screen_bytes,
+            ),
+        );
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let (client_tx, _client_control_rx, client_rx) = test_client_writer();
+        let mut connection = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(client_tx),
+        );
+        connection.iip_graphics = true;
+        server.clients.insert(1, connection);
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        (server, client_rx, pane_id)
+    }
+
+    #[tokio::test]
+    async fn kitty_png_placement_splices_iip_exactly_once() {
+        use base64::Engine as _;
+
+        let png = tiny_test_png();
+        let screen_bytes = kitty_chunked_png_virtual_placement(&png);
+        let (mut server, client_rx, pane_id) = iip_test_server(&screen_bytes);
+
+        // First frame: the virtual placement passes through as exactly one
+        // positioned IIP splice, and the placeholder glyphs are blanked
+        // out of the frame text for this client.
+        server.render_and_stream();
+        let (frame, splices) = read_server_frame_with_sixels(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
+        assert!(
+            !frame_text(&frame).contains('\u{10eeee}'),
+            "placeholder glyphs must be blanked for iip clients"
+        );
+        let inner_rect = server.app.state.view.pane_infos[0].inner_rect;
+        assert_eq!(splices.len(), 1, "one iip splice expected");
+        assert_eq!(splices[0].pane_id, pane_id.raw());
+        assert_eq!(
+            splices[0].rect,
+            protocol::SixelPaneRect {
+                x: inner_rect.x,
+                y: inner_rect.y,
+                width: inner_rect.width,
+                height: inner_rect.height,
+            }
+        );
+        // Placeholder run sits at pane row 1, columns 2-3.
+        assert_eq!((splices[0].row, splices[0].col), (1, 2));
+        // The payload is a complete OSC 1337 IIP sequence with a truthy
+        // inline, an honest decoded size, and the PNG file bytes passed
+        // through untouched (full-image source rect, f=100).
+        assert!(
+            splices[0].data.starts_with(b"\x1b]1337;File="),
+            "iip splice must be an OSC 1337 sequence"
+        );
+        let text = String::from_utf8(splices[0].data.clone()).expect("ascii iip");
+        assert!(text.contains("inline=1"), "header: {text:?}");
+        assert!(
+            text.contains(&format!("size={}", png.len())),
+            "size must be the decoded byte count: {text:?}"
+        );
+        let header_end = text.find(':').expect("header terminator");
+        let payload = text[header_end + 1..]
+            .strip_suffix("\x1b\\")
+            .expect("ST terminator");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .expect("valid base64 payload");
+        assert_eq!(decoded, png, "passthrough must be byte-identical");
+        assert!(
+            !server.clients[&1].iip_transcode.is_empty(),
+            "iip transcode state commits after send success"
+        );
+
+        // An identical second frame emits nothing at all.
+        server.render_and_stream();
+        assert!(
+            client_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "unchanged placement must not re-emit"
+        );
+    }
+
+    #[tokio::test]
+    async fn iip_client_wins_over_sixel_when_both_declared() {
+        let png = tiny_test_png();
+        let screen_bytes = kitty_chunked_png_virtual_placement(&png);
+        let (mut server, client_rx, _pane_id) = iip_test_server(&screen_bytes);
+        server.clients.get_mut(&1).expect("client").sixel_graphics = true;
+
+        server.render_and_stream();
+        let (_, splices) = read_server_frame_with_sixels(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
+        assert_eq!(splices.len(), 1, "one splice expected");
+        assert!(
+            splices[0].data.starts_with(b"\x1b]1337;File="),
+            "iip must win over sixel when both are declared"
+        );
+        assert!(
+            !splices[0].data.starts_with(b"\x1bP"),
+            "no sixel DCS may ride when the iip branch is active"
         );
     }
 

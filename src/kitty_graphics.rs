@@ -829,6 +829,247 @@ pub(crate) fn collect_pane_sixel_transcodes(
 
     SixelTranscodeOutcome { splices, state }
 }
+
+/// Gathers one pane's Kitty placement changes for one IIP client.
+///
+/// Sibling of [`collect_pane_sixel_transcodes`] with identical signature
+/// diffing, caching, and budget discipline, but emissions are OSC 1337
+/// IIP sequences built via [`crate::iip_encode::encode_iip`]. Png
+/// placements whose source rect covers the whole image (and stay within
+/// 16 Mpx) pass their file bytes through untouched; everything else runs
+/// the RGBA prepare/crop path and gets PNG-encoded. IIP sizes emissions
+/// in cells, so the encode cache key's `target` is the clipped cell rect
+/// rather than pixels.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_pane_iip_transcodes(
+    runtime: &crate::terminal::TerminalRuntime,
+    pane_id: PaneId,
+    pane_rect: Rect,
+    client_cell_size: HostCellSize,
+    previous: Option<&SixelTranscodeCache>,
+    encode_cache: &mut crate::sixel_encode::SixelEncodeCache,
+    used_bytes: &mut usize,
+    budget_bytes: usize,
+) -> SixelTranscodeOutcome {
+    /// Intrinsic pixel ceiling for raw PNG passthrough: the client's
+    /// pixelLimit (16'777'216) drops larger images silently, and the
+    /// Rgba encode path downscales to fit instead.
+    const IIP_PNG_PASSTHROUGH_MAX_PIXELS: u64 = 16_000_000;
+
+    let cell_size = if client_cell_size.is_known() {
+        client_cell_size
+    } else {
+        SIXEL_FALLBACK_CELL
+    };
+    let previous = previous.and_then(|cache| cache.pane(pane_id));
+    let scrollback_offset = runtime
+        .scroll_metrics()
+        .map(|m| m.offset_from_bottom as u32)
+        .unwrap_or(0);
+
+    // Pass 1: geometry only — no image data copies.
+    let placements = runtime.kitty_image_placements_with_data_filter(|_| false);
+    if placements.is_empty() {
+        return SixelTranscodeOutcome {
+            splices: Vec::new(),
+            state: PaneTranscodeState::default(),
+        };
+    }
+
+    struct Resolved {
+        key: (u32, u32),
+        tracked: TranscodedPlacement,
+        encode_key: crate::sixel_encode::SixelEncodeKey,
+        source: (u32, u32, u32, u32),
+        target: (u32, u32),
+        row: u16,
+        col: u16,
+        data_fingerprint: u64,
+        changed: bool,
+        png_passthrough: bool,
+    }
+
+    let mut resolved = Vec::with_capacity(placements.len());
+    for placement in &placements {
+        let host_placement = HostPlacement {
+            pane_id,
+            host_image_id: None,
+            area: pane_rect,
+            cell_size,
+            source_key: HostSourceKey::Terminal {
+                pane_id,
+                image_id: placement.image_id,
+            },
+            placement: placement.clone(),
+            scrollback_offset,
+        };
+        let Some((clipped, format_code)) = clipped_placement(&host_placement) else {
+            continue;
+        };
+        let image = image_signature(&host_placement, format_code);
+        let placement_sig = placement_signature(clipped, placement.z, scrollback_offset);
+        let key = (placement.image_id, placement.placement_id);
+        let tracked = TranscodedPlacement {
+            image,
+            placement: placement_sig,
+        };
+        let changed = previous.and_then(|state| state.0.get(&key)).copied() != Some(tracked);
+        let source = (
+            clipped.source_x,
+            clipped.source_y,
+            clipped.source_width,
+            clipped.source_height,
+        );
+        // IIP sizes in cells: the outer terminal scales into the cell
+        // rect itself, so the target is the clipped cell span.
+        let target = (clipped.cols, clipped.rows);
+        let png_passthrough = placement.format == KittyImageFormat::Png
+            && source == (0, 0, placement.image_width, placement.image_height)
+            && (placement.image_width as u64) * (placement.image_height as u64)
+                <= IIP_PNG_PASSTHROUGH_MAX_PIXELS;
+        resolved.push(Resolved {
+            key,
+            tracked,
+            encode_key: crate::sixel_encode::SixelEncodeKey {
+                data_fingerprint: placement.data_fingerprint,
+                data_len: placement.data_len,
+                source,
+                target,
+            },
+            source,
+            target,
+            row: clipped.y - pane_rect.y,
+            col: clipped.x - pane_rect.x,
+            data_fingerprint: placement.data_fingerprint,
+            changed,
+            png_passthrough,
+        });
+    }
+
+    // Pass 2: fetch image bytes only for changed placements whose encode is
+    // not already cached.
+    let needed: HashSet<u64> = resolved
+        .iter()
+        .filter(|entry| entry.changed && !encode_cache.contains(&entry.encode_key))
+        .map(|entry| entry.data_fingerprint)
+        .collect();
+    let mut fetched: HashMap<u64, KittyImagePlacement> = HashMap::new();
+    if !needed.is_empty() {
+        for placement in runtime
+            .kitty_image_placements_with_data_filter(|d| needed.contains(&d.data_fingerprint))
+        {
+            if placement.data.is_empty() {
+                continue;
+            }
+            fetched
+                .entry(placement.data_fingerprint)
+                .or_insert(placement);
+        }
+    }
+
+    let mut splices = Vec::new();
+    let mut state = PaneTranscodeState::default();
+    for entry in resolved {
+        if !entry.changed {
+            state.0.insert(entry.key, entry.tracked);
+            continue;
+        }
+        let encoded = match encode_cache.get(&entry.encode_key) {
+            Some(encoded) => Some(encoded),
+            None => match fetched.get(&entry.data_fingerprint) {
+                Some(placement) => {
+                    let encoded = if entry.png_passthrough {
+                        crate::iip_encode::encode_iip(
+                            crate::iip_encode::IipSource::Png(&placement.data),
+                            entry.target.0,
+                            entry.target.1,
+                        )
+                        .unwrap_or_default()
+                    } else {
+                        let (sx, sy, sw, sh) = entry.source;
+                        prepare_image(placement)
+                            .and_then(|image| {
+                                crate::sixel_encode::crop_rgba(
+                                    &image.rgba,
+                                    image.width,
+                                    image.height,
+                                    sx,
+                                    sy,
+                                    sw,
+                                    sh,
+                                )
+                            })
+                            .and_then(|(cropped, cw, ch)| {
+                                crate::iip_encode::encode_iip(
+                                    crate::iip_encode::IipSource::Rgba {
+                                        data: &cropped,
+                                        width: cw,
+                                        height: ch,
+                                    },
+                                    entry.target.0,
+                                    entry.target.1,
+                                )
+                            })
+                            .unwrap_or_default()
+                    };
+                    // Decode/encode failure yields an empty payload; caching
+                    // it makes the permanent-drop commit below cheap on
+                    // every future signature change of the same bytes.
+                    encode_cache.insert(entry.encode_key, encoded.clone());
+                    Some(encoded)
+                }
+                // Data unavailable this pass (image raced away): leave the
+                // old signature in place so the placement retries.
+                None => {
+                    if let Some(old) = previous.and_then(|state| state.0.get(&entry.key)) {
+                        state.0.insert(entry.key, *old);
+                    }
+                    continue;
+                }
+            },
+        };
+        let Some(encoded) = encoded else { continue };
+        if encoded.is_empty() {
+            state.0.insert(entry.key, entry.tracked);
+            continue;
+        }
+        let cost = encoded.len() + SIXEL_TRANSCODE_SPLICE_SLACK;
+        if cost > budget_bytes {
+            tracing::warn!(
+                pane = pane_id.raw(),
+                bytes = encoded.len(),
+                budget = budget_bytes,
+                "dropping oversized iip transcode emission"
+            );
+            state.0.insert(entry.key, entry.tracked);
+            continue;
+        }
+        if *used_bytes + cost > budget_bytes {
+            // Over budget this frame: keep the previous signature (or
+            // none) so the placement re-diffs as changed next frame.
+            if let Some(old) = previous.and_then(|state| state.0.get(&entry.key)) {
+                state.0.insert(entry.key, *old);
+            }
+            continue;
+        }
+        *used_bytes += cost;
+        splices.push(crate::protocol::SixelSplice {
+            pane_id: pane_id.raw(),
+            rect: crate::protocol::SixelPaneRect {
+                x: pane_rect.x,
+                y: pane_rect.y,
+                width: pane_rect.width,
+                height: pane_rect.height,
+            },
+            row: entry.row,
+            col: entry.col,
+            data: encoded,
+        });
+        state.0.insert(entry.key, entry.tracked);
+    }
+
+    SixelTranscodeOutcome { splices, state }
+}
 fn encode_terminal_graphics_update_legacy(
     bytes: &mut Vec<u8>,
     placements: &[HostPlacement],
