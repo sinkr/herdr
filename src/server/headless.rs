@@ -5103,6 +5103,10 @@ impl HeadlessServer {
                     "dropping oversized graphics payload for client frame"
                 );
                 frame.graphics.clear();
+                // The dropped payload was supposed to fill this frame's
+                // Kitty Unicode placeholder cells; without it they render
+                // as naked glyphs on the client.
+                crate::kitty_graphics::blank_placeholder_cells(&mut frame);
                 commit_graphics_cache = false;
                 encoded.incomplete = false;
             }
@@ -5164,6 +5168,10 @@ impl HeadlessServer {
                         continue;
                     };
                     text_only_frame.graphics.clear();
+                    // Same as the pre-serialize drop above: placeholder
+                    // cells must not ship without the payload that fills
+                    // them.
+                    crate::kitty_graphics::blank_placeholder_cells(&mut text_only_frame);
                     // Passthrough payloads (spliced bytes or semantic
                     // records in the discarded `prepared`) ride the dropped
                     // frame too; keep their delivery watermarks unmoved so
@@ -10657,6 +10665,105 @@ next_tab = ""
         server.resize_shared_runtime_to_effective_size();
 
         (server, client_rx, pane_id)
+    }
+
+    /// Kitty APC bytes chunk-uploading a `side`×`side` zeroed RGBA image
+    /// and placing it as a 2×1-cell Unicode-placeholder virtual placement
+    /// with placeholder cells at pane row 1, columns 2-3 (the
+    /// [`KITTY_VIRTUAL_PLACEMENT`] recipe, scaled to arbitrary image
+    /// sizes). Large sides make the native Kitty replay re-encode exceed
+    /// [`MAX_GRAPHICS_FRAME_SIZE`]: base64 inflates the raw pixels by 4/3.
+    fn kitty_chunked_virtual_placement(side: u32) -> Vec<u8> {
+        use base64::Engine as _;
+        use std::io::Write as _;
+
+        let data = vec![0u8; (side * side * 4) as usize];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        let mut bytes = Vec::with_capacity(encoded.len() + encoded.len() / 4096 * 32 + 256);
+        let chunks = encoded.as_bytes().chunks(4096);
+        let last_index = chunks.len() - 1;
+        for (index, chunk) in chunks.enumerate() {
+            let more = if index == last_index { 0 } else { 1 };
+            if index == 0 {
+                let _ = write!(
+                    bytes,
+                    "\x1b_Gq=2,a=t,t=d,f=32,s={side},v={side},i=1193046,m={more};"
+                );
+            } else {
+                let _ = write!(bytes, "\x1b_Gq=2,m={more};");
+            }
+            bytes.extend_from_slice(chunk);
+            bytes.extend_from_slice(b"\x1b\\");
+        }
+        bytes.extend_from_slice(b"\x1b_Gq=2,a=p,U=1,i=1193046,c=2,r=1\x1b\\");
+        bytes.extend_from_slice(
+            "\x1b[2;3H\x1b[38;2;18;52;86m\u{10eeee}\u{0305}\u{0305}\u{10eeee}\u{0305}\u{030d}\x1b[0m"
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    /// A native Kitty client whose frame graphics payload exceeds
+    /// [`MAX_GRAPHICS_FRAME_SIZE`] must not receive the Unicode
+    /// placeholder cells the dropped payload was supposed to fill: they
+    /// would render as naked placeholder glyphs across the placement
+    /// area (the process-global replay flag is off in this test, so the
+    /// render itself keeps the placeholder cells, exactly like the
+    /// production incident).
+    #[tokio::test]
+    async fn oversized_graphics_drop_blanks_kitty_unicode_placeholders() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("test");
+        let pane_id = workspace.focused_pane_id().expect("focused pane");
+        // 2560×2560 RGBA = 25 MiB raw → ~33.7 MiB re-encoded payload,
+        // past the 32 MiB MAX_GRAPHICS_FRAME_SIZE budget.
+        let screen_bytes = kitty_chunked_virtual_placement(2560);
+        workspace.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_kitty_graphics_screen_bytes(
+                80,
+                24,
+                &screen_bytes,
+            ),
+        );
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.kitty_graphics_enabled = true;
+
+        let (client_tx, _client_control_rx, client_rx) = test_client_writer();
+        let connection = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize {
+                width_px: 9,
+                height_px: 18,
+            },
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(client_tx),
+        );
+        server.clients.insert(1, connection);
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        server.render_and_stream();
+        let frame = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(1000))
+                .expect("frame delivered despite dropped graphics"),
+        );
+        assert!(
+            frame.graphics.is_empty(),
+            "oversized graphics payload must be dropped"
+        );
+        assert!(
+            !frame_text(&frame).contains('\u{10eeee}'),
+            "placeholder cells must be blanked when their graphics payload is dropped"
+        );
     }
 
     #[tokio::test]

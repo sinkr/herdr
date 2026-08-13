@@ -194,6 +194,35 @@ pub(crate) fn placeholders_hidden() -> bool {
         .unwrap_or_else(is_enabled)
 }
 
+/// True when a frame cell's symbol renders the Kitty Unicode placeholder
+/// (U+10EEEE as the grapheme base, optionally followed by the row/col
+/// diacritics). Shared detection for render-time blanking and
+/// post-render scrubbing.
+pub(crate) fn is_placeholder_symbol(symbol: &str) -> bool {
+    symbol.chars().next().map(u32::from) == Some(crate::ghostty::KITTY_UNICODE_PLACEHOLDER)
+}
+
+/// Blanks every Kitty Unicode placeholder cell in `frame`, in place.
+///
+/// Placeholder cells only make sense while the graphics payload that
+/// fills them is delivered. When a frame's graphics are dropped for
+/// exceeding the per-frame budget, the placeholders would otherwise ship
+/// to the client and render as naked glyph soup across the placement
+/// area. Each placeholder cell becomes a plain space keeping its
+/// background color; the foreground color and modifiers are reset because
+/// they encode the image id and diacritic routing, not styling.
+pub(crate) fn blank_placeholder_cells(frame: &mut crate::protocol::FrameData) {
+    for cell in &mut frame.cells {
+        if is_placeholder_symbol(&cell.symbol) {
+            cell.symbol.clear();
+            cell.symbol.push(' ');
+            cell.fg = 0;
+            cell.modifier = 0;
+            cell.hyperlink = None;
+        }
+    }
+}
+
 pub(crate) fn paint_local_pane_graphics(
     app: &AppState,
     graphics: &crate::app::pane_graphics::Runtime,
@@ -2155,6 +2184,59 @@ mod tests {
         if before == is_enabled() {
             assert_eq!(hidden, before);
         }
+    }
+
+    #[test]
+    fn blank_placeholder_cells_scrubs_placeholder_glyphs_in_place() {
+        let placeholder = |symbol: &str| crate::protocol::CellData {
+            symbol: symbol.to_string(),
+            fg: 0x02_12_34_56, // image-id color, not a real foreground
+            bg: 0x02_10_20_30,
+            modifier: ratatui::style::Modifier::UNDERLINED.bits(),
+            skip: false,
+            hyperlink: Some(0),
+        };
+        let mut frame = crate::protocol::FrameData {
+            cells: vec![
+                placeholder("\u{10eeee}\u{0305}\u{0305}"),
+                placeholder("\u{10eeee}\u{0305}\u{030d}"),
+                crate::protocol::CellData {
+                    symbol: "x".to_string(),
+                    fg: 7,
+                    bg: 3,
+                    modifier: 1,
+                    skip: false,
+                    hyperlink: None,
+                },
+                placeholder("\u{10eeee}"),
+            ],
+            width: 4,
+            height: 1,
+            cursor: None,
+            hyperlinks: vec!["https://example.com".to_string()],
+            graphics: Vec::new(),
+        };
+
+        blank_placeholder_cells(&mut frame);
+
+        for cell in [&frame.cells[0], &frame.cells[1], &frame.cells[3]] {
+            assert_eq!(cell.symbol, " ", "placeholder becomes a blank space");
+            assert_eq!(cell.fg, 0, "image-id foreground reset");
+            assert_eq!(cell.bg, 0x02_10_20_30, "background preserved");
+            assert_eq!(cell.modifier, 0, "modifiers reset");
+            assert_eq!(cell.hyperlink, None, "hyperlink cleared");
+        }
+        let untouched = &frame.cells[2];
+        assert_eq!(
+            (
+                untouched.symbol.as_str(),
+                untouched.fg,
+                untouched.bg,
+                untouched.modifier
+            ),
+            ("x", 7, 3, 1),
+            "non-placeholder cells stay untouched"
+        );
     }
 
     fn test_placement(viewport_col: i32, viewport_row: i32) -> HostPlacement {

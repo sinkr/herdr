@@ -3258,8 +3258,7 @@ fn ghostty_buffer_symbol_into<'a>(
         crate::ghostty::CellWide::Narrow | crate::ghostty::CellWide::Wide => {
             cells.grapheme_text_into(grapheme_bytes, symbol_scratch)?;
             let hidden_kitty_placeholder = hide_kitty_placeholders
-                && symbol_scratch.chars().next().map(u32::from)
-                    == Some(crate::ghostty::KITTY_UNICODE_PLACEHOLDER);
+                && crate::kitty_graphics::is_placeholder_symbol(symbol_scratch);
             if hidden_kitty_placeholder || symbol_scratch.is_empty() {
                 symbol_scratch.clear();
                 symbol_scratch.push(' ');
