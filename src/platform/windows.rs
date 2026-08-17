@@ -971,6 +971,9 @@ pub fn current_process_is_detached_server_daemon() -> bool {
     matches!(current_process_is_in_job(), Ok(false))
 }
 
+/// Windows has no SIGHUP; console lifetime is handled via DETACHED_PROCESS.
+pub fn shield_detached_server_daemon_from_sighup() {}
+
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     select_pane_foreground_job_cached(child_pid)
 }

@@ -5720,6 +5720,12 @@ fn ctrlc_handler(should_quit: Arc<AtomicBool>, server_event_tx: mpsc::Sender<Ser
         // Wake up the event loop so the quit flag is checked promptly.
         let _ = server_event_tx.try_send(ServerEvent::QuitSignal);
     });
+    // ctrlc's "termination" feature registers SIGINT, SIGTERM, and SIGHUP
+    // together. A detached daemon must not treat SIGHUP as quit — that is
+    // how a dying terminal (or whatever cleans up after it) used to take the
+    // whole server and every pane down with it — so re-shield SIGHUP after
+    // ctrlc re-registered it. Foreground `herdr server` runs keep all three.
+    crate::platform::shield_detached_server_daemon_from_sighup();
 }
 
 /// Sleep until a deadline, or return pending if none.
@@ -5786,6 +5792,11 @@ fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
 pub fn run_server() -> io::Result<()> {
     init_logging();
     crate::platform::raise_server_nofile_limit();
+    // Swap the SIG_IGN the daemon spawn installed for a no-op handler before
+    // any pane can be spawned: a handler resets to default on exec, so pane
+    // shells keep normal hangup behavior while the detached server itself
+    // stays immune to SIGHUP. No-op for foreground (non-detached) runs.
+    crate::platform::shield_detached_server_daemon_from_sighup();
 
     let args: Vec<String> = std::env::args().collect();
     if args.get(2).map(String::as_str) == Some("--handoff-import") {

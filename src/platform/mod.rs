@@ -83,6 +83,15 @@ pub fn detach_server_daemon_command(command: &mut std::process::Command) {
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // Ignore SIGHUP before exec so a terminal-driven hangup cannot
+            // kill the daemon during startup: SIG_IGN survives execve, closing
+            // the window between spawn and the server installing its own
+            // signal handling. The server swaps this for a no-op handler in
+            // `shield_detached_server_daemon_from_sighup` so pane children do
+            // not inherit the ignore disposition.
+            if libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -91,6 +100,37 @@ pub fn detach_server_daemon_command(command: &mut std::process::Command) {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn current_process_is_detached_server_daemon() -> bool {
     unsafe { libc::getsid(0) == libc::getpid() }
+}
+
+/// No-op SIGHUP handler for the detached server daemon.
+///
+/// A handler (rather than SIG_IGN) is deliberate: execve resets caught
+/// signals to their default disposition, so pane processes spawned by the
+/// server get normal SIGHUP behavior. An inherited SIG_IGN would leak into
+/// every pane shell and break hangup-based pane termination.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+extern "C" fn ignore_daemon_sighup(_signal: libc::c_int) {}
+
+/// Makes a detached server daemon immune to SIGHUP so the server never dies
+/// because the terminal (or the client) that auto-started it went away.
+///
+/// Foreground `herdr server` runs are not session leaders and keep the
+/// default quit-on-hangup behavior, and SIGINT/SIGTERM stay untouched
+/// everywhere. Must be called again after any code that re-registers SIGHUP
+/// (the ctrlc handler registers SIGINT/SIGTERM/SIGHUP together).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn shield_detached_server_daemon_from_sighup() {
+    if !current_process_is_detached_server_daemon() {
+        return;
+    }
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = ignore_daemon_sighup as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // Keep blocking stdin and socket reads from failing with EINTR.
+    action.sa_flags = libc::SA_RESTART;
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
+    }
 }
 
 /// Raised by the SIGWINCH handler, consumed by the host resize watcher.

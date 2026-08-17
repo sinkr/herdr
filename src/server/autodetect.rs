@@ -398,6 +398,40 @@ test "$sid" = "$$"
         );
     }
 
+    /// The daemon spawn must leave the child immune to SIGHUP from the very
+    /// first instruction: SIG_IGN set in pre_exec survives execve, so no
+    /// terminal hangup can kill the server during its startup window.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn server_daemon_detach_spawn_survives_sighup() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::platform::detach_server_daemon_command(&mut command);
+
+        let mut child = command.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+
+        // Let the shell reach exec before signalling.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "detached server daemon spawn must survive SIGHUP"
+        );
+
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = child.wait();
+    }
+
     #[test]
     fn is_server_listening_returns_true_for_live_socket() {
         let dir = unique_test_dir("live");

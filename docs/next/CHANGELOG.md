@@ -71,6 +71,7 @@
 - Agent hooks now invoke the running Herdr binary instead of whichever binary appears first on `PATH`. (#2722, thanks @Pimpmuckl)
 - Closing a terminal running `herdr --remote` no longer produces a local client core dump while the remote session stays alive. (#2424)
 - Active Space and Agent rows now use dedicated theme colors that remain visible when the host terminal background matches the selected Herdr theme. (#2792)
+- Auto-started Unix server daemons now ignore SIGHUP, so a dying terminal (or its cleanup) can no longer gracefully shut down the background server and every pane in it. Foreground `herdr server` runs keep the default hangup, Ctrl+C, and SIGTERM behavior.
 - `agent prompt` now rejects agents already waiting at approval or question dialogs with `agent_blocked`, without sending text or Enter. (#2788)
 - `agent start` now waits for new pane shells and first-run agent prompts to become ready instead of racing them or reporting premature readiness. (#2410, #2537, #2773, #2774, thanks @Pimpmuckl)
 - `prefix+e` now preserves logical lines when opening soft-wrapped scrollback in an editor. (#2733)
