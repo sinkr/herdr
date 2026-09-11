@@ -268,6 +268,13 @@ impl HeadlessServer {
             let Some(surface) = client.render_state.last_pane_surface() else {
                 fallback!("no_baseline");
             };
+            if self.app.state.kitty_graphics_enabled
+                && client.passthrough
+                && ((!client.sixel_transcode.is_empty() && client.sixel_graphics)
+                    || (!client.iip_transcode.is_empty() && client.iip_graphics))
+            {
+                fallback!("transcode_state_active");
+            }
             if surface.boot_id != self.client_shell_boot_id
                 || surface.projection_revision != client.shell_projection_revision
                 || surface.frame.width != *cols
@@ -317,6 +324,35 @@ impl HeadlessServer {
             ) else {
                 fallback!("runtime_missing");
             };
+            for recipient in &recipients {
+                let Some(client) = self.clients.get(&recipient.client_id) else {
+                    fallback!("client_missing");
+                };
+                if !client.passthrough
+                    || !recipient
+                        .surface
+                        .panes
+                        .iter()
+                        .any(|pane| pane.pane_id == public_pane_id)
+                {
+                    continue;
+                }
+                if runtime.has_pending_sixels_after(
+                    client.sixel_watermarks.get(&pane_id).copied().unwrap_or(0),
+                ) || runtime.has_pending_osc5522_after(
+                    client.osc_watermarks.get(&pane_id).copied().unwrap_or(0),
+                ) {
+                    fallback!("pending_passthrough");
+                }
+                if self.app.state.kitty_graphics_enabled
+                    && (client.sixel_graphics || client.iip_graphics)
+                    && !runtime
+                        .kitty_image_placements_with_data_filter(|_| false)
+                        .is_empty()
+                {
+                    fallback!("visible_transcode");
+                }
+            }
             let Some(snapshot) = runtime.collect_dirty_patch_snapshot(width, height) else {
                 fallback!("terminal_snapshot");
             };

@@ -566,6 +566,9 @@ impl HeadlessServer {
         let Some(client) = self.clients.get(&client_id) else {
             return false;
         };
+        if client.geometry_passive {
+            return false;
+        }
         let (cols, rows) = client.terminal_size;
         let cell_size = if client.cell_size.is_known() {
             client.cell_size
@@ -613,13 +616,18 @@ impl HeadlessServer {
         let active_shell_count = self
             .clients
             .values()
-            .filter(|client| client.is_active_shell_client() && client.writer.is_some())
+            .filter(|client| {
+                client.is_active_shell_client()
+                    && !client.geometry_passive
+                    && client.writer.is_some()
+            })
             .count();
         if active_shell_count != 1 {
             return false;
         }
         let Some(client_id) = self.clients.iter().find_map(|(&client_id, client)| {
-            (client.is_active_shell_client() && client.writer.is_some()).then_some(client_id)
+            (client.is_active_shell_client() && !client.geometry_passive && client.writer.is_some())
+                .then_some(client_id)
         }) else {
             return false;
         };
@@ -632,7 +640,10 @@ impl HeadlessServer {
     ) -> bool {
         let mut viewed_tabs = HashMap::<String, Vec<u64>>::new();
         for (&client_id, client) in &self.clients {
-            if !client.is_active_shell_client() || client.writer.is_none() {
+            if !client.is_active_shell_client()
+                || client.geometry_passive
+                || client.writer.is_none()
+            {
                 continue;
             }
             let Some(tab_id) = self.shell_tab_id_for_client(client_id) else {
@@ -694,7 +705,7 @@ impl HeadlessServer {
         if !self
             .clients
             .get(&client_id)
-            .is_some_and(|client| client.shell_surface_active)
+            .is_some_and(|client| client.shell_surface_active && !client.geometry_passive)
         {
             return false;
         }
@@ -715,7 +726,7 @@ impl HeadlessServer {
         if !self
             .clients
             .get(&client_id)
-            .is_some_and(|client| client.shell_surface_active)
+            .is_some_and(|client| client.shell_surface_active && !client.geometry_passive)
         {
             return false;
         }

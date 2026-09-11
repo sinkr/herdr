@@ -635,3 +635,70 @@ fn styled_client_composition_preserves_pane_hyperlinks() {
     let link = frame.cells[index].hyperlink.expect("linked cell") as usize;
     assert_eq!(frame.hyperlinks[link], "https://example.test");
 }
+
+#[test]
+fn enhanced_paste_reply_preserves_bytes_and_targets_focused_pane() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let bytes = b"\x1b]5522;type=write:mime=x;aGk=\x1b\\";
+    let outcome = state.handle_input_bytes(bytes);
+    let [ClientMessage::EndpointControl { kind, data }] = outcome.requests.as_slice() else {
+        panic!("enhanced paste must use a targeted endpoint control");
+    };
+    assert_eq!(kind, crate::protocol::endpoint::PANE_OSC5522_KIND);
+    let reply: crate::protocol::endpoint::EndpointPaneOsc5522 = serde_json::from_str(data).unwrap();
+    assert_eq!(reply.pane_id, "pane_1");
+    assert_eq!(reply.data, bytes);
+}
+
+#[test]
+fn passthrough_waits_for_matching_surface_and_is_consumed_once() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    let splice = crate::protocol::SixelSplice {
+        pane_id: 1,
+        rect: crate::protocol::SixelPaneRect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 2,
+        },
+        row: 1,
+        col: 2,
+        data: b"sixel".to_vec(),
+    };
+    let mut pending = vec![(
+        ClientEndpointId::Local,
+        crate::protocol::endpoint::EndpointPassthrough {
+            boot_id: "boot-1".into(),
+            projection_revision: 1,
+            surface_revision: 2,
+            sixels: vec![splice.clone()],
+            iip: vec![crate::protocol::SixelSplice {
+                data: b"iip".to_vec(),
+                ..splice
+            }],
+            raw_osc: vec![crate::protocol::RawOsc {
+                pane_id: 1,
+                data: b"\x1b]5522;type=read\x07".to_vec(),
+            }],
+        },
+    )];
+    assert!(state
+        .take_passthrough_bytes(&mut pending, (106, 20))
+        .is_empty());
+    let mut next = surface();
+    next.surface_revision = 2;
+    state.set_pane_surface(next);
+    let area = state.layout(106, 20).pane_surface;
+    let position = format!("\x1b7\x1b[{};{}H", area.y + 2, area.x + 3);
+    let expected = format!("{position}sixel\x1b8{position}iip\x1b8\x1b]5522;type=read\x07",);
+    assert_eq!(
+        state.take_passthrough_bytes(&mut pending, (106, 20)),
+        expected.as_bytes()
+    );
+    assert!(state
+        .take_passthrough_bytes(&mut pending, (106, 20))
+        .is_empty());
+}

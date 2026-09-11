@@ -4,6 +4,7 @@ use super::*;
 pub fn run_server() -> io::Result<()> {
     init_logging();
     crate::platform::raise_server_nofile_limit();
+    crate::platform::shield_detached_server_daemon_from_sighup();
 
     let args: Vec<String> = std::env::args().collect();
     if args.get(2).map(String::as_str) == Some("--handoff-import") {

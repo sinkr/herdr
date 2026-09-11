@@ -557,6 +557,9 @@ fn windows_client_input_event_from_raw(
         | crate::raw_input::RawInputEvent::HostPaletteColors { .. }
         | crate::raw_input::RawInputEvent::HostColorSchemeChanged(_)
         | crate::raw_input::RawInputEvent::HostCellSizeReport { .. }
+        // Raw OSC passthrough is not carried by the Windows structured
+        // input path; the web attach stack is Unix byte-stream input.
+        | crate::raw_input::RawInputEvent::Osc5522(_)
         | crate::raw_input::RawInputEvent::Unsupported => None,
     }
 }
@@ -567,7 +570,7 @@ fn stdin_read_ready<R: AsRawFd>(reader: &R, timeout_ms: i32) -> Option<bool> {
 }
 
 #[cfg(unix)]
-fn poll_read_ready(fd: i32, timeout_ms: i32) -> Option<bool> {
+pub(crate) fn poll_read_ready(fd: i32, timeout_ms: i32) -> Option<bool> {
     #[repr(C)]
     struct PollFd {
         fd: i32,

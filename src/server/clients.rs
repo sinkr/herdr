@@ -143,6 +143,31 @@ pub(crate) struct ClientConnection {
     pub(crate) render_state: ClientRenderState,
     /// Image assets already included in the selected ClientShell scene.
     pub(crate) shell_graphics_delivery: crate::kitty_graphics::surface::DeliveryCache,
+    /// Per-client Kitty→Sixel transcode signature state, populated only
+    /// for SemanticFrame clients that declared `sixel_graphics`.
+    pub(crate) sixel_transcode: crate::kitty_graphics::SixelTranscodeCache,
+    /// True when the client's Hello declared a Sixel-capable outer
+    /// terminal (drives Kitty→Sixel transcode and placeholder blanking).
+    pub(crate) sixel_graphics: bool,
+    /// Per-client Kitty→IIP transcode signature state, populated only
+    /// for SemanticFrame clients that declared `iip_graphics`. Reuses the
+    /// Sixel cache type: its signatures are format-agnostic.
+    pub(crate) iip_transcode: crate::kitty_graphics::SixelTranscodeCache,
+    /// True when the client's Hello declared an IIP-capable outer
+    /// terminal (drives Kitty→IIP transcode and placeholder blanking).
+    pub(crate) iip_graphics: bool,
+    /// True when the client's Hello declared it a geometry-passive viewer:
+    /// it is never selected as the foreground client, so its terminal
+    /// geometry never drives pane sizing.
+    pub(crate) geometry_passive: bool,
+    pub(crate) passthrough: bool,
+    /// Per-pane watermark of the highest Sixel emission sequence sent to
+    /// this client. Emissions at or below the watermark are never re-sent.
+    pub(crate) sixel_watermarks: HashMap<crate::layout::PaneId, u64>,
+    /// Per-pane watermark of the highest raw OSC emission sequence sent to
+    /// this client. Separate from `sixel_watermarks`: the two passthrough
+    /// streams advance independently.
+    pub(crate) osc_watermarks: HashMap<crate::layout::PaneId, u64>,
     /// Passive eligibility for audited local Kitty regular-file graphics.
     pub(crate) direct_graphics: bool,
     /// Whether this frontend preserves exact SGR pixel reports.
@@ -227,6 +252,14 @@ impl ClientConnection {
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
             shell_graphics_delivery: crate::kitty_graphics::surface::DeliveryCache::default(),
+            sixel_transcode: crate::kitty_graphics::SixelTranscodeCache::default(),
+            sixel_graphics: false,
+            iip_transcode: crate::kitty_graphics::SixelTranscodeCache::default(),
+            iip_graphics: false,
+            geometry_passive: false,
+            passthrough: false,
+            sixel_watermarks: HashMap::new(),
+            osc_watermarks: HashMap::new(),
             direct_graphics: false,
             pixel_mouse: false,
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
@@ -467,7 +500,7 @@ impl ClientConnection {
 pub(crate) fn latest_shell_client(clients: &HashMap<u64, ClientConnection>) -> Option<u64> {
     clients
         .iter()
-        .filter(|(_, client)| client.is_active_shell_client())
+        .filter(|(_, client)| client.is_active_shell_client() && !client.geometry_passive)
         .max_by_key(|(_, client)| client.last_activity)
         .map(|(&client_id, _)| client_id)
 }

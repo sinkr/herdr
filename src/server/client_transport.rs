@@ -395,10 +395,18 @@ pub(crate) enum ServerEvent {
         endpoint_keybindings: bool,
         mouse_capture: bool,
         surface_active: bool,
+        sixel_graphics: bool,
+        iip_graphics: bool,
+        geometry_passive: bool,
+        passthrough: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
     ClientInput { client_id: u64, data: Vec<u8> },
+    ClientViewer {
+        client_id: u64,
+        geometry_passive: bool,
+    },
     /// A client reported the one armed Kitty regular-file response.
     GraphicsTransmissionResult {
         client_id: u64,
@@ -476,6 +484,11 @@ pub(crate) enum ServerEvent {
         pixel_mouse: bool,
     },
     /// A client-owned shell delivered semantic input to one stable pane target.
+    ClientShellOsc5522 {
+        client_id: u64,
+        pane_id: String,
+        data: Vec<u8>,
+    },
     ClientShellPaneInput {
         client_id: u64,
         pane_id: String,
@@ -760,6 +773,10 @@ pub(crate) fn handle_client_handshake(
                     hello.endpoint_keybindings,
                     hello.mouse_capture,
                     hello.surface_active,
+                    hello.sixel_graphics,
+                    hello.iip_graphics,
+                    hello.geometry_passive,
+                    hello.passthrough,
                 )),
             )
         }
@@ -854,6 +871,10 @@ pub(crate) fn handle_client_handshake(
         endpoint_keybindings,
         mouse_capture,
         surface_active,
+        sixel_graphics,
+        iip_graphics,
+        geometry_passive,
+        passthrough,
     )) = shell_options
     {
         ServerEvent::ClientShellConnected {
@@ -867,6 +888,10 @@ pub(crate) fn handle_client_handshake(
             endpoint_keybindings,
             mouse_capture,
             surface_active,
+            sixel_graphics,
+            iip_graphics,
+            geometry_passive,
+            passthrough,
             writer,
         }
     } else {
@@ -1000,7 +1025,14 @@ fn client_read_loop_with_endpoint_controls(
             ClientMessage::Input { data } => {
                 // Validate input size.
                 if data.len() > MAX_INPUT_PAYLOAD {
-                    if crate::raw_input::is_complete_text_bracketed_paste(&data) {
+                    if crate::raw_input::is_complete_osc5522(&data)
+                        && data.len() <= crate::raw_input::OSC5522_MAX_SEQUENCE_BYTES
+                    {
+                        // A single complete enhanced-paste packet (e.g. an
+                        // image paste answering an OMP read request) may
+                        // legitimately exceed the interactive input limit.
+                        ServerEvent::ClientInput { client_id, data }
+                    } else if crate::raw_input::is_complete_text_bracketed_paste(&data) {
                         warn!(
                             client_id,
                             size = data.len(),
@@ -1289,6 +1321,40 @@ fn client_read_loop_with_endpoint_controls(
                     token: data,
                 }
             }
+            ClientMessage::EndpointControl { kind, data }
+                if kind == crate::protocol::endpoint::VIEWER_KIND =>
+            {
+                #[derive(serde::Deserialize)]
+                struct Viewer {
+                    geometry_passive: bool,
+                }
+                let Ok(viewer) = serde_json::from_str::<Viewer>(&data) else {
+                    continue;
+                };
+                ServerEvent::ClientViewer {
+                    client_id,
+                    geometry_passive: viewer.geometry_passive,
+                }
+            }
+            ClientMessage::EndpointControl { kind, data }
+                if kind == crate::protocol::endpoint::PANE_OSC5522_KIND =>
+            {
+                let Ok(packet) =
+                    serde_json::from_str::<crate::protocol::endpoint::EndpointPaneOsc5522>(&data)
+                else {
+                    continue;
+                };
+                if packet.data.len() > crate::raw_input::OSC5522_MAX_SEQUENCE_BYTES
+                    || !crate::raw_input::is_complete_osc5522(&packet.data)
+                {
+                    continue;
+                }
+                ServerEvent::ClientShellOsc5522 {
+                    client_id,
+                    pane_id: packet.pane_id,
+                    data: packet.data,
+                }
+            }
             ClientMessage::EndpointControl { kind, data } => {
                 let Some(response) = crate::server::client_endpoint_control::response(&kind, data)
                 else {
@@ -1417,6 +1483,10 @@ mod tests {
             endpoint_keybindings: true,
             mouse_capture: true,
             surface_active: true,
+            sixel_graphics: false,
+            iip_graphics: false,
+            geometry_passive: false,
+            passthrough: false,
             snapshot_codecs: vec![crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![crate::protocol::endpoint::SURFACE_CODEC_V1.into()],
             input_codecs: vec![crate::protocol::endpoint::INPUT_CODEC_V1.into()],
@@ -1830,6 +1900,7 @@ mod tests {
                 mouse_capture,
                 surface_active,
                 writer,
+                ..
             } => {
                 assert_eq!(client_id, 43);
                 assert_eq!((surface_cols, surface_rows), (80, 29));

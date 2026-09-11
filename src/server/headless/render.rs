@@ -469,13 +469,20 @@ impl HeadlessServer {
                     continue;
                 }
             }
+            let transcode = self.app.state.kitty_graphics_enabled
+                && self.clients.get(&client_id).is_some_and(|client| {
+                    client.passthrough && (client.sixel_graphics || client.iip_graphics)
+                });
+            let _placeholder_scope = crate::kitty_graphics::hide_placeholders_for_render(
+                transcode || crate::kitty_graphics::is_enabled(),
+            );
             let shell_graphics_delivery = self
                 .clients
                 .get(&client_id)
                 .map(|client| client.shell_graphics_delivery.clone())
                 .unwrap_or_default();
             let mut surface_parts = None;
-            let frame = match mode {
+            let mut frame = match &mode {
                 ClientConnectionMode::ClientShell => {
                     let render_started = crate::render_prof::timer();
                     let render_cell_size = if cell_size.is_known() {
@@ -510,7 +517,7 @@ impl HeadlessServer {
                 ClientConnectionMode::TerminalPending => continue,
                 ClientConnectionMode::TerminalAttach { terminal_id }
                 | ClientConnectionMode::TerminalObserve { terminal_id } => {
-                    let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) else {
+                    let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) else {
                         self.send_to_client(
                             client_id,
                             ServerMessage::ServerShutdown {
@@ -546,9 +553,173 @@ impl HeadlessServer {
                 }
             };
 
+            let terminal_ansi = !matches!(mode, ClientConnectionMode::ClientShell);
+            let mut passthrough = protocol::endpoint::EndpointPassthrough {
+                boot_id: self.client_shell_boot_id.clone(),
+                projection_revision: shell_projection_revision,
+                surface_revision: 0,
+                sixels: Vec::new(),
+                raw_osc: Vec::new(),
+                iip: Vec::new(),
+            };
+            let mut sixel_bytes = Vec::new();
+            let mut osc_bytes = Vec::new();
+            let mut sixel_commits = Vec::new();
+            let mut osc_commits = Vec::new();
+            let mut sixel_states = Vec::new();
+            let mut iip_states = Vec::new();
+            let mut visible_panes = HashSet::new();
+            let mut sources = Vec::new();
+            if let Some((panes, _, _, _, _)) = &surface_parts {
+                for pane in panes {
+                    if let Some((workspace_index, pane_id)) = self.app.parse_pane_id(&pane.pane_id)
+                    {
+                        if let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
+                            &self.app.terminal_runtimes,
+                            workspace_index,
+                            pane_id,
+                        ) {
+                            sources.push((
+                                pane_id,
+                                runtime,
+                                Rect::new(
+                                    pane.inner_rect.x,
+                                    pane.inner_rect.y,
+                                    pane.inner_rect.width,
+                                    pane.inner_rect.height,
+                                ),
+                            ));
+                        }
+                    }
+                }
+            } else if let ClientConnectionMode::TerminalAttach { terminal_id }
+            | ClientConnectionMode::TerminalObserve { terminal_id } = &mode
+            {
+                if let Some((pane_id, runtime)) = self
+                    .app
+                    .state
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.tabs)
+                    .flat_map(|tab| &tab.panes)
+                    .find_map(|(&pane_id, pane)| {
+                        (pane.attached_terminal_id.as_str() == terminal_id)
+                            .then(|| {
+                                self.app
+                                    .terminal_runtimes
+                                    .get(&pane.attached_terminal_id)
+                                    .map(|runtime| (pane_id, runtime))
+                            })
+                            .flatten()
+                    })
+                {
+                    sources.push((pane_id, runtime, area));
+                }
+            }
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                for &(pane_id, runtime, pane_rect) in &sources {
+                    visible_panes.insert(pane_id);
+                    if client.passthrough || terminal_ansi {
+                        let outcome = Self::collect_client_pane_sixels(
+                            client.sixel_watermarks.get(&pane_id).copied(),
+                            terminal_ansi,
+                            runtime,
+                            pane_id,
+                            pane_rect,
+                            &mut sixel_bytes,
+                            &mut passthrough.sixels,
+                        );
+                        if let Some(init) = outcome.init {
+                            client.sixel_watermarks.insert(pane_id, init);
+                        }
+                        if let Some(seq) = outcome.delivered {
+                            sixel_commits.push((pane_id, seq));
+                        }
+                        let outcome = Self::collect_client_pane_raw_osc(
+                            client.osc_watermarks.get(&pane_id).copied(),
+                            terminal_ansi,
+                            runtime,
+                            pane_id,
+                            &mut osc_bytes,
+                            &mut passthrough.raw_osc,
+                        );
+                        if let Some(init) = outcome.init {
+                            client.osc_watermarks.insert(pane_id, init);
+                        }
+                        if let Some(seq) = outcome.delivered {
+                            osc_commits.push((pane_id, seq));
+                        }
+                    }
+                }
+                let mut transcode_bytes = passthrough
+                    .sixels
+                    .iter()
+                    .map(|splice| splice.data.len() + Self::SIXEL_SPLICE_SLACK)
+                    .sum();
+                for (pane_id, runtime, pane_rect) in sources {
+                    if transcode {
+                        if client.iip_graphics {
+                            let outcome = crate::kitty_graphics::collect_pane_iip_transcodes(
+                                runtime,
+                                pane_id,
+                                pane_rect,
+                                cell_size,
+                                Some(&client.iip_transcode),
+                                &mut self.iip_encode_cache,
+                                &mut transcode_bytes,
+                                Self::SIXEL_FRAME_BUDGET,
+                            );
+                            passthrough.iip.extend(outcome.splices);
+                            iip_states.push((pane_id, outcome.state));
+                        } else if client.sixel_graphics {
+                            let outcome = crate::kitty_graphics::collect_pane_sixel_transcodes(
+                                runtime,
+                                pane_id,
+                                pane_rect,
+                                cell_size,
+                                Some(&client.sixel_transcode),
+                                &mut self.sixel_encode_cache,
+                                &mut transcode_bytes,
+                                Self::SIXEL_FRAME_BUDGET,
+                            );
+                            passthrough.sixels.extend(outcome.splices);
+                            sixel_states.push((pane_id, outcome.state));
+                        }
+                    }
+                }
+            }
+            let has_passthrough = !passthrough.sixels.is_empty()
+                || !passthrough.raw_osc.is_empty()
+                || !passthrough.iip.is_empty();
+            if transcode {
+                crate::kitty_graphics::blank_placeholder_cells(&mut frame);
+                if let Some((_, _, _, graphics, _)) = &mut surface_parts {
+                    graphics.assets.retain(|asset| {
+                        !matches!(
+                            asset.key.source,
+                            protocol::SurfaceGraphicsSource::Terminal { .. }
+                        )
+                    });
+                    graphics.placements.retain(|placement| {
+                        !matches!(
+                            placement.asset.source,
+                            protocol::SurfaceGraphicsSource::Terminal { .. }
+                        )
+                    });
+                    graphics.retained_assets.retain(|asset| {
+                        !matches!(
+                            asset.source,
+                            protocol::SurfaceGraphicsSource::Terminal { .. }
+                        )
+                    });
+                }
+            }
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
             };
+            if has_passthrough {
+                client.request_repaint();
+            }
             let Some(writer) = client.writer.as_ref().cloned() else {
                 crate::render_prof::event("full_render.writer_missing");
                 continue;
@@ -576,20 +747,31 @@ impl HeadlessServer {
                         graphics,
                     })
             } else {
-                client.render_state.prepare_frame(frame)
+                client
+                    .render_state
+                    .prepare_frame_with_sixels(frame, &sixel_bytes, &osc_bytes)
             };
             let Some(mut prepared) = prepared else {
+                client.sixel_watermarks.extend(sixel_commits);
+                client.osc_watermarks.extend(osc_commits);
+                for (pane_id, state) in sixel_states {
+                    client.sixel_transcode.commit(pane_id, state);
+                }
+                for (pane_id, state) in iip_states {
+                    client.iip_transcode.commit(pane_id, state);
+                }
                 client.clear_deferred_render();
                 crate::render_prof::event("full_render.skip_identical");
                 continue;
             };
-            let max = if has_graphics {
+            let max = if has_graphics || !sixel_bytes.is_empty() || !osc_bytes.is_empty() {
                 MAX_GRAPHICS_FRAME_SIZE
             } else {
                 crate::protocol::MAX_FRAME_SIZE
             };
             let mut shell_assets_deferred = false;
-            let serialized = match Self::frame_server_message_with_max(prepared.message(), max) {
+            let mut serialized = match Self::frame_server_message_with_max(prepared.message(), max)
+            {
                 Ok(frame) => frame,
                 Err(protocol::FramingError::Oversized { claimed, max }) if has_graphics => {
                     warn!(
@@ -627,11 +809,49 @@ impl HeadlessServer {
                     continue;
                 }
             };
+            if has_passthrough {
+                if let ServerMessage::PaneSurface(surface) = prepared.message() {
+                    passthrough.surface_revision = surface.surface_revision;
+                }
+                let packet = protocol::endpoint::passthrough_message(&passthrough)
+                    .map_err(io::Error::other)
+                    .and_then(|message| {
+                        Self::frame_server_message_with_max(&message, MAX_GRAPHICS_FRAME_SIZE)
+                            .map_err(io::Error::other)
+                    });
+                let packet = match packet {
+                    Ok(packet) => packet,
+                    Err(err) => {
+                        warn!(client_id, err = %err, "failed to serialize graphics passthrough");
+                        client.defer_full_render();
+                        continue;
+                    }
+                };
+                serialized.extend_from_slice(&packet);
+            }
             let shell_graphics_pending = next_shell_graphics_delivery
                 .as_ref()
                 .is_some_and(crate::kitty_graphics::surface::DeliveryCache::has_pending);
             match writer.render.try_send(serialized) {
                 Ok(()) => {
+                    client.sixel_watermarks.extend(sixel_commits);
+                    client.osc_watermarks.extend(osc_commits);
+                    for pane_id in client.sixel_transcode.tracked_panes() {
+                        if !transcode || !visible_panes.contains(&pane_id) {
+                            client.sixel_transcode.commit(pane_id, Default::default());
+                        }
+                    }
+                    for pane_id in client.iip_transcode.tracked_panes() {
+                        if !transcode || !visible_panes.contains(&pane_id) {
+                            client.iip_transcode.commit(pane_id, Default::default());
+                        }
+                    }
+                    for (pane_id, state) in sixel_states {
+                        client.sixel_transcode.commit(pane_id, state);
+                    }
+                    for (pane_id, state) in iip_states {
+                        client.iip_transcode.commit(pane_id, state);
+                    }
                     if let Some(delivery) = next_shell_graphics_delivery {
                         client.shell_graphics_delivery = delivery;
                     }

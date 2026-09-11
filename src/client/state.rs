@@ -41,6 +41,10 @@ pub(super) struct ClientState {
     pub(super) draw_host_cursor: bool,
     pub(super) detached_process_children: Vec<std::process::Child>,
     pub(super) shell: Option<shell::ClientShellState>,
+    pub(super) pending_passthrough: Vec<(
+        endpoint::ClientEndpointId,
+        crate::protocol::endpoint::EndpointPassthrough,
+    )>,
 }
 
 impl Drop for ClientState {
@@ -63,6 +67,7 @@ impl ClientState {
 
     pub(super) fn freeze_presentation(&mut self) {
         self.presentation_frozen = true;
+        self.pending_passthrough.clear();
     }
 
     pub(super) fn record_host_theme_update(
@@ -223,7 +228,19 @@ impl ClientState {
         } else {
             &[]
         };
-        let _ = write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
+        let passthrough = self
+            .shell
+            .as_ref()
+            .map(|shell| {
+                shell.take_passthrough_bytes(&mut self.pending_passthrough, self.reported_size)
+            })
+            .unwrap_or_default();
+        let _ = frame_output::write_encoded_frame_with_passthrough(
+            &mut stdout,
+            &encoded.bytes,
+            graphics,
+            &passthrough,
+        );
         let _ = stdout.flush();
         self.blit_encoder.commit(frame_data, encoded);
         self.repaint_pending = false;

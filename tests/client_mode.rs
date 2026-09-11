@@ -808,11 +808,13 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
                 || { read_output(&output).contains("Local") }
             ));
             let mut input = client._master.as_ref().unwrap().take_writer().unwrap();
-            input
-                .write_all(b"printf 'LOCAL_%s\\n' DIRECT_READY\r")
-                .unwrap();
-            assert!(wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
-                read_output(&output).contains("LOCAL_DIRECT_READY")
+            // The sidebar can render before the host-effects fence admits input.
+            assert!(wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+                if read_output(&output).contains("LOCAL_DIRECT_READY") {
+                    return true;
+                }
+                input.write_all(b"printf 'LOCAL_%s\\n' DIRECT_READY\r").unwrap();
+                false
             }), "Local must accept input without waiting for SSH (remote selected: {select_remote}): {}", read_output(&output));
             let text = read_output(&output);
             assert!(!text.contains("Local: connecting"), "{text}");
@@ -989,8 +991,8 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
         "printf 'LOCAL_RECOVERED_SURFACE\\n'",
     );
     let watermark = output_len(&output);
-    // Select the fresh workspace below Local's restored workspace.
-    input.write_all(b"\x1b[<0;7;5M\x1b[<0;7;5m").unwrap();
+    // Select Local independently of whether its previous workspace was persisted.
+    input.write_all(b"\x1b[<0;7;3M\x1b[<0;7;3m").unwrap();
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
             read_output(&output)[watermark..].contains("LOCAL_RECOVERED_SURFACE")

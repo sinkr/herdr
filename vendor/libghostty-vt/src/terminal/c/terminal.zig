@@ -235,12 +235,12 @@ pub const ModeConfig = extern struct {
 
 /// C callback state for terminal effects. Most trampolines are always
 /// installed on the stream handler; they check these fields and no-op when
-/// the corresponding callback is null. The unknown-sequence and
-/// clipboard trampolines are installed dynamically to preserve their
+/// the corresponding callback is null. The unknown-sequence, clipboard,
+/// and OSC 5522 trampolines are installed dynamically to preserve their
 /// null fast paths (for clipboard_write, a null Zig-level effect makes
 /// Kitty clipboard writes fail up front instead of spooling a
 /// transaction that can never commit; for clipboard_read it keeps
-/// reads denied).
+/// reads denied; for osc5522 it preserves native clipboard handling).
 const Effects = struct {
     userdata: ?*anyopaque = null,
     write_pty: ?WritePtyFn = null,
@@ -257,6 +257,8 @@ const Effects = struct {
     clipboard_write: ?ClipboardWriteFn = null,
     clipboard_read: ?ClipboardReadFn = null,
     unknown_sequence: ?UnknownSequenceFn = null,
+    sixel: ?SixelFn = null,
+    osc5522: ?Osc5522Fn = null,
 
     /// Scratch buffer for DA1 feature codes. The device attributes
     /// trampoline converts C feature codes into this buffer and returns
@@ -319,6 +321,18 @@ const Effects = struct {
     /// if size is available, or false to suppress the XTWINOPS response or
     /// mode 2048 report.
     pub const SizeFn = *const fn (Terminal, ?*anyopaque, *size_report.Size) callconv(lib.calling_conv) bool;
+
+    /// C function pointer type for the sixel callback. The data is the
+    /// complete re-synthesized Sixel DCS sequence and is only valid for
+    /// the duration of the call. Row/col are the 0-based cursor cell in
+    /// the active screen area captured when the sequence started.
+    pub const SixelFn = *const fn (Terminal, ?*anyopaque, [*]const u8, usize, u16, u16) callconv(lib.calling_conv) void;
+
+    /// C function pointer type for the osc5522 callback. The data is the
+    /// complete re-synthesized OSC 5522 sequence
+    /// (`ESC ] 5522 ; <body> <terminator>`) and is only valid for the
+    /// duration of the call.
+    pub const Osc5522Fn = *const fn (Terminal, ?*anyopaque, [*]const u8, usize) callconv(lib.calling_conv) void;
 
     /// C function pointer type for the device_attributes callback.
     /// Returns true and fills out_attrs if attributes are available,
@@ -632,6 +646,23 @@ const Effects = struct {
         if (func(@ptrCast(wrapper), wrapper.effects.userdata, &s)) return s;
         return null;
     }
+
+    fn sixelTrampoline(
+        handler: *Handler,
+        data: []const u8,
+        row: size.CellCountInt,
+        col: size.CellCountInt,
+    ) void {
+        const wrapper = TerminalWrapper.fromHandler(handler);
+        const func = wrapper.effects.sixel orelse return;
+        func(@ptrCast(wrapper), wrapper.effects.userdata, data.ptr, data.len, row, col);
+    }
+
+    fn osc5522Trampoline(handler: *Handler, data: []const u8) void {
+        const wrapper = TerminalWrapper.fromHandler(handler);
+        const func = wrapper.effects.osc5522 orelse return;
+        func(@ptrCast(wrapper), wrapper.effects.userdata, data.ptr, data.len);
+    }
 };
 
 /// C: GhosttyTerminal
@@ -674,10 +705,12 @@ fn wrap(
         .pwd_changed = &Effects.pwdChangedTrampoline,
         .progress_report = &Effects.progressReportTrampoline,
         .size = &Effects.sizeTrampoline,
+        .sixel = &Effects.sixelTrampoline,
 
         // Installed dynamically when the callback is set; see Effects.
         .clipboard_write = null,
         .clipboard_read = null,
+        .osc5522 = null,
     };
 
     wrapper.* = .{
@@ -1174,6 +1207,8 @@ pub const Option = enum(c_int) {
     terminfo_name = 37,
     clipboard_read = 38,
     clipboard_write_max_bytes = 39,
+    sixel = 40,
+    osc5522 = 41,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1194,6 +1229,8 @@ pub const Option = enum(c_int) {
             .clipboard_read => ?Effects.ClipboardReadFn,
             .unknown_sequence => ?Effects.UnknownSequenceFn,
             .title, .pwd, .terminfo_name => ?*const lib.String,
+            .sixel => ?Effects.SixelFn,
+            .osc5522 => ?Effects.Osc5522Fn,
             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
             .color_palette => ?*const color.PaletteC,
             .kitty_image_storage_limit => ?*const u64,
@@ -1285,6 +1322,18 @@ fn setTyped(
             ptr.*
         else
             false,
+        .sixel => wrapper.effects.sixel = value,
+        .osc5522 => {
+            wrapper.effects.osc5522 = value;
+            wrapper.stream.handler.effects.osc5522 = if (value != null)
+                &Effects.osc5522Trampoline
+            else
+                null;
+            wrapper.stream.parser.osc_parser.max_bytes_5522 = if (value != null)
+                20 * 1024 * 1024
+            else
+                null;
+        },
         .title => {
             const str = if (value) |v| v.ptr[0..v.len] else "";
             wrapper.terminal.setTitle(str) catch return .out_of_memory;

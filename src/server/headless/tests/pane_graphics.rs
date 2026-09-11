@@ -627,6 +627,7 @@ async fn pixel_mouse_activation_requires_graphics_demand_not_direct_transport() 
 }
 
 #[tokio::test]
+
 async fn graphics_pruning_preserves_live_panes_and_removes_closed_panes() {
     let (mut server, _client_rx, pane_id) = retained_test_server(b"aaaa");
     set_graphics_layer(&mut server, pane_id, vec![1, 2, 3]);

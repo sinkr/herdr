@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -1279,6 +1279,56 @@ pub struct TerminalFrame {
     pub full: bool,
     /// Terminal escape bytes ready to write directly to stdout.
     pub bytes: Vec<u8>,
+}
+
+/// On-screen cell rectangle of a pane within a semantic frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SixelPaneRect {
+    /// Column (0-based) of the pane content area's left edge in the frame.
+    pub x: u16,
+    /// Row (0-based) of the pane content area's top edge in the frame.
+    pub y: u16,
+    /// Content width in columns.
+    pub width: u16,
+    /// Content height in rows.
+    pub height: u16,
+}
+
+/// A one-shot Sixel passthrough emission riding a semantic frame.
+///
+/// The server resolves the emitting pane's on-screen content rect at the
+/// moment the carrying frame is rendered, so `rect` and the frame are always
+/// mutually consistent. `row`/`col` stay pane-local (as captured at DCS
+/// dispatch time); the client positions the payload at `rect` + (`row`,
+/// `col`) and skips emissions whose cell falls outside the rect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SixelSplice {
+    /// Raw id of the emitting pane (`layout::PaneId::raw`).
+    pub pane_id: u32,
+    /// The pane's content rect within the carrying frame.
+    pub rect: SixelPaneRect,
+    /// Pane-local cell row of the emission cursor.
+    pub row: u16,
+    /// Pane-local cell column of the emission cursor.
+    pub col: u16,
+    /// Full Sixel DCS sequence bytes, ready to write to a terminal.
+    #[serde(with = "super::endpoint::json_bytes")]
+    pub data: Vec<u8>,
+}
+
+/// A one-shot raw OSC passthrough emission riding a semantic frame.
+///
+/// Unlike [`SixelSplice`], the payload is location-independent: the client
+/// writes the bytes verbatim after painting the frame, with no positioning
+/// or wrapping. Used for OSC 5522 (enhanced paste) sequences emitted by a
+/// pane, so protocol-aware clients (e.g. the web bridge) can answer them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawOsc {
+    /// Raw id of the emitting pane (`layout::PaneId::raw`).
+    pub pane_id: u32,
+    /// Full OSC sequence bytes (`ESC ] 5522 ; ... terminator`).
+    #[serde(with = "super::endpoint::json_bytes")]
+    pub data: Vec<u8>,
 }
 
 /// Notification kind forwarded from server to client.
