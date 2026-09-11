@@ -228,3 +228,47 @@ just test-one kitty_file_image_survives
 (cd vendor/libghostty-vt && zig build test-lib-vt -Dtest-filter='experimental PNG')
 just check
 ```
+
+## 0008 expose Sixel and OSC 5522 passthrough
+
+status: active
+
+patch: `vendor/patches/libghostty-vt/0008-sixel-osc5522-passthrough.patch`
+
+herdr issue: none; local graphics and viewer patch stack
+
+upstream discussion: not opened
+
+upstream pr: not opened
+
+vendored base: `44f2a44df7e8c4a0c6df3f7d872ef3d7ead88e51`
+
+local files:
+
+- `vendor/libghostty-vt/include/ghostty/vt/terminal.h`
+- `vendor/libghostty-vt/src/terminal/c/terminal.zig`
+- `vendor/libghostty-vt/src/terminal/dcs.zig`
+- `vendor/libghostty-vt/src/terminal/osc.zig`
+- `vendor/libghostty-vt/src/terminal/stream_terminal.zig`
+- `vendor/libghostty-vt/src/termio/stream_handler.zig`
+
+reason: Herdr must forward complete Sixel DCS emissions to Sixel-capable
+clients without decoding them, including the pane-relative cursor position
+where each emission began. It must also forward complete OSC 5522 clipboard
+packets to protocol-aware clients instead of consuming them in the embedded
+terminal. Both callbacks are optional and bounded; oversized sequences are
+dropped whole rather than delivered truncated, and disabling OSC 5522
+passthrough restores libghostty's native clipboard handling.
+
+remove when: upstream exposes equivalent bounded, opt-in callbacks for complete
+Sixel and OSC 5522 sequences with cursor-position capture and native clipboard
+fallback, and Herdr passes the checks below without this patch.
+
+verification:
+
+```sh
+just test-one sixel
+just test-one osc5522
+just maintenance-test
+just check
+```

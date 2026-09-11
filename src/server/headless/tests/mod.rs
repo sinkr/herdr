@@ -123,6 +123,8 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         server_config_diagnostic: None,
         server_config_diagnostic_without_keybindings: None,
         terminal_attach_owners: HashMap::new(),
+        sixel_encode_cache: crate::sixel_encode::SixelEncodeCache::default(),
+        iip_encode_cache: crate::sixel_encode::SixelEncodeCache::default(),
         pending_alt_screen_reads: Vec::new(),
         deferred_alt_screen_reads: Vec::new(),
         next_activity_stamp: 1,
@@ -739,6 +741,10 @@ async fn client_shell_attach_seeds_workspace() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            sixel_graphics: false,
+            iip_graphics: false,
+            geometry_passive: false,
+            passthrough: false,
             writer,
         })
     );
@@ -772,6 +778,10 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
         surface_reuse: false,
         surface_delta: false,
         surface_scroll: false,
+        sixel_graphics: false,
+        iip_graphics: false,
+        geometry_passive: false,
+        passthrough: false,
         writer,
     });
     let (_, initial) = client_shell_projection(&control_rx);
@@ -831,6 +841,10 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            sixel_graphics: false,
+            iip_graphics: false,
+            geometry_passive: false,
+            passthrough: false,
             writer,
         })
     );
@@ -947,6 +961,10 @@ async fn client_shell_pairs_agent_view_set_replacement_and_clear_with_snapshots(
             cell_height_px: 0,
             pixel_mouse: false,
             direct_graphics: false,
+            sixel_graphics: false,
+            iip_graphics: false,
+            geometry_passive: false,
+            passthrough: false,
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: false,
@@ -1053,6 +1071,10 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            sixel_graphics: false,
+            iip_graphics: false,
+            geometry_passive: false,
+            passthrough: false,
             writer,
         })
     );
@@ -1221,6 +1243,10 @@ fn connect_test_shell(
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            sixel_graphics: false,
+            iip_graphics: false,
+            geometry_passive: false,
+            passthrough: false,
             writer,
         })
     );
@@ -1826,6 +1852,10 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            sixel_graphics: false,
+            iip_graphics: false,
+            geometry_passive: false,
+            passthrough: false,
             writer: local_writer,
         })
     );
@@ -1851,6 +1881,10 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             endpoint_keybindings: true,
             mouse_capture: false,
             surface_active: true,
+            sixel_graphics: false,
+            iip_graphics: false,
+            geometry_passive: false,
+            passthrough: false,
             writer: endpoint_writer,
         })
     );
@@ -2771,6 +2805,10 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            sixel_graphics: false,
+            iip_graphics: false,
+            geometry_passive: false,
+            passthrough: false,
             writer,
         })
     );
@@ -3018,6 +3056,10 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            sixel_graphics: false,
+            iip_graphics: false,
+            geometry_passive: false,
+            passthrough: false,
             writer,
         })
     );

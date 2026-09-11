@@ -321,6 +321,10 @@ pub const Parser = struct {
     /// smaller policy than the default.
     max_allocating_bytes: usize,
 
+    /// Optional OSC 5522 capture limit for passthrough embedders. Native
+    /// clipboard handling uses max_allocating_bytes unless overridden.
+    max_bytes_5522: ?usize = null,
+
     /// Current state of the parser.
     state: State,
 
@@ -616,7 +620,10 @@ pub const Parser = struct {
                 Capture.allocating(
                     &self.capture,
                     alloc,
-                    self.max_allocating_bytes,
+                    if (self.state == .@"5522")
+                        self.max_bytes_5522 orelse self.max_allocating_bytes
+                    else
+                        self.max_allocating_bytes,
                 ) catch {
                     // The allocator failed for some reason, fall back to a fixed buffer
                     // and hope that it's big enough.

@@ -48,8 +48,9 @@ pub(crate) use self::terminal::test_encode_key_for_app;
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
-    TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
-    TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint, TerminalWordMotion,
+    PendingRawOsc, PendingSixel, TerminalCompressionStep, TerminalDirtyPatch,
+    TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalSearchDirection, TerminalSearchWindow,
+    TerminalTextPoint, TerminalWordMotion,
 };
 pub use self::{
     state::PaneState,
@@ -3653,6 +3654,65 @@ impl PaneRuntime {
 
     pub(crate) fn kitty_image_fingerprints(&self, image_ids: &[u32]) -> Vec<Option<u64>> {
         self.terminal.kitty_image_fingerprints(image_ids)
+    }
+
+    pub fn has_pending_sixels_after(&self, after_seq: u64) -> bool {
+        self.terminal.has_pending_sixels_after(after_seq)
+    }
+
+    pub fn latest_sixel_seq(&self) -> u64 {
+        self.terminal.latest_sixel_seq()
+    }
+
+    pub fn encode_pending_sixels_after(
+        &self,
+        after_seq: u64,
+        origin: (u16, u16),
+        budget: usize,
+        out: &mut Vec<u8>,
+    ) -> u64 {
+        self.terminal
+            .encode_pending_sixels_after(after_seq, origin, budget, out)
+    }
+
+    pub fn collect_pending_sixels_after(
+        &self,
+        after_seq: u64,
+        used: usize,
+        budget: usize,
+        out: &mut Vec<crate::pane::PendingSixel>,
+    ) -> u64 {
+        self.terminal
+            .collect_pending_sixels_after(after_seq, used, budget, out)
+    }
+
+    pub fn has_pending_osc5522_after(&self, after_seq: u64) -> bool {
+        self.terminal.has_pending_osc5522_after(after_seq)
+    }
+
+    pub fn latest_osc5522_seq(&self) -> u64 {
+        self.terminal.latest_osc5522_seq()
+    }
+
+    pub fn encode_pending_osc5522_after(
+        &self,
+        after_seq: u64,
+        budget: usize,
+        out: &mut Vec<u8>,
+    ) -> u64 {
+        self.terminal
+            .encode_pending_osc5522_after(after_seq, budget, out)
+    }
+
+    pub fn collect_pending_osc5522_after(
+        &self,
+        after_seq: u64,
+        used: usize,
+        budget: usize,
+        out: &mut Vec<crate::pane::PendingRawOsc>,
+    ) -> u64 {
+        self.terminal
+            .collect_pending_osc5522_after(after_seq, used, budget, out)
     }
 
     pub fn keyboard_protocol(&self) -> crate::input::KeyboardProtocol {

@@ -30,14 +30,25 @@ impl std::ops::Deref for ComposedFrame {
 
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 
+#[cfg(test)]
 pub(super) fn write_composed_frame(
-    mut writer: impl io::Write,
+    writer: impl io::Write,
     encoded: &[u8],
     graphics: &GraphicsOutput,
     files: &mut super::image_files::FileTransport,
 ) -> io::Result<()> {
+    write_composed_frame_with_passthrough(writer, encoded, graphics, files, &[])
+}
+
+pub(super) fn write_composed_frame_with_passthrough(
+    writer: impl io::Write,
+    encoded: &[u8],
+    graphics: &GraphicsOutput,
+    files: &mut super::image_files::FileTransport,
+    passthrough: &[u8],
+) -> io::Result<()> {
     if graphics.is_empty() {
-        return writer.write_all(encoded);
+        return write_encoded_frame_with_passthrough(writer, encoded, &[], passthrough);
     }
     let mut writer = io::BufWriter::with_capacity(64 * 1024, writer);
     let insertion = render_ansi::final_sync_output_end(encoded).unwrap_or(encoded.len());
@@ -77,6 +88,7 @@ pub(super) fn write_composed_frame(
         }
     }
     writer.write_all(b"\x1b8")?;
+    writer.write_all(passthrough)?;
     writer.write_all(&encoded[insertion..])?;
     io::Write::flush(&mut writer)
 }
@@ -86,17 +98,27 @@ pub(super) fn write_encoded_frame_with_graphics(
     encoded: &[u8],
     graphics: &[u8],
 ) -> io::Result<()> {
-    if graphics.is_empty() {
+    write_encoded_frame_with_passthrough(&mut writer, encoded, graphics, &[])
+}
+
+pub(super) fn write_encoded_frame_with_passthrough(
+    mut writer: impl io::Write,
+    encoded: &[u8],
+    graphics: &[u8],
+    passthrough: &[u8],
+) -> io::Result<()> {
+    if graphics.is_empty() && passthrough.is_empty() {
         return writer.write_all(encoded);
     }
-
     let insertion = render_ansi::final_sync_output_end(encoded).unwrap_or(encoded.len());
-
     writer.write_all(&encoded[..insertion])?;
-    record_received_kitty_graphics(graphics);
-    writer.write_all(b"\x1b7")?;
-    writer.write_all(graphics)?;
-    writer.write_all(b"\x1b8")?;
+    if !graphics.is_empty() {
+        record_received_kitty_graphics(graphics);
+        writer.write_all(b"\x1b7")?;
+        writer.write_all(graphics)?;
+        writer.write_all(b"\x1b8")?;
+    }
+    writer.write_all(passthrough)?;
     writer.write_all(&encoded[insertion..])
 }
 
@@ -169,4 +191,37 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// Appends one Sixel emission as a cursor-safe positioned write: DECSC
+/// (`ESC 7`) + CUP to the 1-based absolute cell + the raw DCS payload +
+/// DECRC (`ESC 8`).
+///
+/// `pane_rect` is the emitting pane's on-screen content rect for the frame
+/// the splice arrived with; `None` (pane not visible) emits nothing, as
+/// does a pane-local cell that falls outside the rect (pane resized or
+/// scrolled since capture) or an absolute cell outside the frame.
+pub(super) fn append_sixel_splice(
+    out: &mut Vec<u8>,
+    pane_rect: Option<crate::protocol::SixelPaneRect>,
+    row: u16,
+    col: u16,
+    data: &[u8],
+    frame_size: (u16, u16),
+) {
+    let Some(rect) = pane_rect else {
+        return;
+    };
+    if row >= rect.height || col >= rect.width {
+        return;
+    }
+    let abs_row = u32::from(rect.y) + u32::from(row);
+    let abs_col = u32::from(rect.x) + u32::from(col);
+    if abs_row >= u32::from(frame_size.1) || abs_col >= u32::from(frame_size.0) {
+        return;
+    }
+    out.extend_from_slice(b"\x1b7");
+    out.extend_from_slice(format!("\x1b[{};{}H", abs_row + 1, abs_col + 1).as_bytes());
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\x1b8");
 }
