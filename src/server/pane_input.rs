@@ -330,6 +330,12 @@ fn apply_client_terminal_input_events(
                     .try_send_paste(text)
                     .map_err(|err| format!("targeted pane paste failed: {err}"))?;
             }
+            crate::raw_input::RawInputEvent::Osc5522(data) => {
+                runtime.scroll_reset();
+                runtime
+                    .try_send_bytes(Bytes::from(data))
+                    .map_err(|err| format!("targeted pane enhanced paste failed: {err}"))?;
+            }
             crate::raw_input::RawInputEvent::Mouse(_)
             | crate::raw_input::RawInputEvent::OuterFocusGained
             | crate::raw_input::RawInputEvent::OuterFocusLost

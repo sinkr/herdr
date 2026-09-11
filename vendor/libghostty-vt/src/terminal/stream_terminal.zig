@@ -19,6 +19,7 @@ const kitty_clipboard = @import("kitty/clipboard.zig");
 const kitty_color = @import("kitty/color.zig");
 const paste_pkg = @import("paste.zig");
 const kitty_dnd = @import("kitty/dnd.zig");
+const size = @import("size.zig");
 const size_report = @import("size_report.zig");
 const simd = @import("../simd/main.zig");
 const terminfo = @import("../terminfo/main.zig");
@@ -72,8 +73,12 @@ pub const Handler = struct {
     /// the kitty graphics protocol.
     apc_handler: apc.Handler = .{},
 
-    /// The DCS command handler maintains state for DCS queries.
+    /// The DCS command handler maintains state for queries and Sixel passthrough.
     dcs_handler: dcs.Handler = .{},
+
+    /// Cursor cell in the active screen captured at DCS hook time.
+    sixel_hook_x: size.CellCountInt = 0,
+    sixel_hook_y: size.CellCountInt = 0,
 
     /// The in-flight Kitty clipboard protocol (OSC 5522) write
     /// transaction, if any. Null means no transaction is active.
@@ -201,6 +206,27 @@ pub const Handler = struct {
         /// is 256 bytes; longer strings will be silently ignored.
         xtversion: ?*const fn (*Handler) []const u8,
 
+        /// Called when a complete Sixel DCS sequence has been received.
+        /// The data is the full re-synthesized sequence
+        /// (`ESC P <params> q <payload> ESC \`) and is only valid for the
+        /// duration of the call. The row/col are the 0-based cursor cell
+        /// in the active screen area captured when the sequence started.
+        ///
+        /// The terminal does NOT decode or store Sixel data; this effect
+        /// exists so embedders can pass the sequence through to an
+        /// attached sixel-capable terminal.
+        sixel: ?*const fn (*Handler, data: []const u8, row: size.CellCountInt, col: size.CellCountInt) void,
+
+        /// Called when a complete OSC 5522 (kitty clipboard protocol /
+        /// enhanced paste) sequence has been received. The data is the
+        /// full re-synthesized sequence (`ESC ] 5522 ; <body> <terminator>`)
+        /// and is only valid for the duration of the call.
+        ///
+        /// When set, this replaces native OSC 5522 clipboard handling so
+        /// an attached client can implement the protocol without duplicate
+        /// responses. Null preserves the native clipboard effects.
+        osc5522: ?*const fn (*Handler, data: []const u8) void,
+
         /// No effects means that the stream effectively becomes readonly
         /// that only affects pure terminal state and ignores all side
         /// effects beyond that.
@@ -215,6 +241,8 @@ pub const Handler = struct {
             .enquiry = null,
             .progress_report = null,
             .size = null,
+            .sixel = null,
+            .osc5522 = null,
             .title_changed = null,
             .pwd_changed = null,
             .write_pty = null,
@@ -529,6 +557,8 @@ pub const Handler = struct {
     }
 
     fn dcsHook(self: *Handler, value: Action.Value(.dcs_hook)) !void {
+        self.sixel_hook_x = self.terminal.screens.active.cursor.x;
+        self.sixel_hook_y = self.terminal.screens.active.cursor.y;
         var cmd = self.dcs_handler.hook(
             self.terminal.gpa(),
             value,
@@ -551,6 +581,11 @@ pub const Handler = struct {
 
     fn dcsCommand(self: *Handler, cmd: *dcs.Command) !void {
         switch (cmd.*) {
+            .sixel => |*sixel| {
+                const func = self.effects.sixel orelse return;
+                func(self, sixel.bytes(), self.sixel_hook_y, self.sixel_hook_x);
+            },
+
             .decrqss => |request| {
                 var response: [
                     dcs.Command.DECRQSS.max_response_bytes + 1
@@ -606,6 +641,26 @@ pub const Handler = struct {
             "\x1bP1+r" ++ encoded_tn_key ++ "={X}\x1b\\",
             .{name},
         ) catch unreachable);
+    }
+
+    /// Forward an OSC 5522 packet without interpreting clipboard metadata.
+    fn oscKittyClipboard(self: *Handler, v: Action.KittyClipboard) !void {
+        const func = self.effects.osc5522 orelse return;
+
+        var aw: std.Io.Writer.Allocating = try .initCapacity(
+            self.terminal.gpa(),
+            "\x1b]5522;".len + v.metadata.len +
+                (if (v.payload) |p| p.len + 1 else 0) + 2,
+        );
+        defer aw.deinit();
+        try aw.writer.writeAll("\x1b]5522;");
+        try aw.writer.writeAll(v.metadata);
+        if (v.payload) |payload| {
+            try aw.writer.writeByte(';');
+            try aw.writer.writeAll(payload);
+        }
+        try aw.writer.writeAll(v.terminator.string());
+        func(self, aw.written());
     }
 
     fn bell(self: *Handler) void {
@@ -789,6 +844,12 @@ pub const Handler = struct {
         self: *Handler,
         v: Action.Value(.kitty_clipboard),
     ) error{OutOfMemory}!void {
+        if (self.effects.osc5522 != null) {
+            // Switching to passthrough abandons any native write transaction.
+            self.kittyClipboardAbort();
+            return self.oscKittyClipboard(v) catch return error.OutOfMemory;
+        }
+
         // Decode and validate the metadata.
         var arena: std.heap.ArenaAllocator = .init(self.terminal.gpa());
         defer arena.deinit();
@@ -6535,4 +6596,108 @@ test "full reset drops kitty clipboard grants" {
     try testing.expectEqual(@as(usize, 1), S.read_count);
     try testing.expect(!S.last_read_granted);
     try s.handler.kitty_clipboard_grants.grant(testing.allocator, "pw", .read, false);
+}
+
+test "osc5522 effect surfaces full sequence once with BEL terminator" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var calls: usize = 0;
+        var captured: ?[]const u8 = null;
+        fn osc5522(_: *Handler, data: []const u8) void {
+            calls += 1;
+            if (captured) |old| testing.allocator.free(old);
+            captured = testing.allocator.dupe(u8, data) catch @panic("OOM");
+        }
+    };
+    S.calls = 0;
+    S.captured = null;
+    defer if (S.captured) |old| testing.allocator.free(old);
+
+    var handler: Handler = .init(&t);
+    handler.effects.osc5522 = &S.osc5522;
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // Metadata plus payload; the payload may itself contain ';'.
+    s.nextSlice("before\x1b]5522;type=write:mime=dGV4dA==;aGVsbG87d28=\x07after");
+    try testing.expectEqual(@as(usize, 1), S.calls);
+    try testing.expectEqualStrings(
+        "\x1b]5522;type=write:mime=dGV4dA==;aGVsbG87d28=\x07",
+        S.captured.?,
+    );
+
+    // Surrounding text still prints normally.
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("beforeafter", str);
+}
+
+test "osc5522 effect surfaces full sequence with ST terminator" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var calls: usize = 0;
+        var captured: ?[]const u8 = null;
+        fn osc5522(_: *Handler, data: []const u8) void {
+            calls += 1;
+            if (captured) |old| testing.allocator.free(old);
+            captured = testing.allocator.dupe(u8, data) catch @panic("OOM");
+        }
+    };
+    S.calls = 0;
+    S.captured = null;
+    defer if (S.captured) |old| testing.allocator.free(old);
+
+    var handler: Handler = .init(&t);
+    handler.effects.osc5522 = &S.osc5522;
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // Metadata only (a read request), split across writes.
+    s.nextSlice("\x1b]5522;type=re");
+    try testing.expectEqual(@as(usize, 0), S.calls);
+    s.nextSlice("ad:pw=abc\x1b\\");
+    try testing.expectEqual(@as(usize, 1), S.calls);
+    try testing.expectEqualStrings("\x1b]5522;type=read:pw=abc\x1b\\", S.captured.?);
+}
+
+test "osc5522 over-cap sequence is dropped entirely" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var calls: usize = 0;
+        fn osc5522(_: *Handler, _: []const u8) void {
+            calls += 1;
+        }
+    };
+    S.calls = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.osc5522 = &S.osc5522;
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+    s.parser.osc_parser.max_bytes_5522 = 32;
+
+    s.nextSlice("\x1b]5522;type=write;");
+    for (0..64) |_| s.next('A');
+    s.nextSlice("\x07after");
+
+    // Dropped entirely: never surfaced, not even truncated.
+    try testing.expectEqual(@as(usize, 0), S.calls);
+
+    // The terminal keeps working after the dropped sequence.
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("after", str);
+
+    // A follow-up in-cap sequence is surfaced normally.
+    s.nextSlice("\x1b]5522;type=read\x1b\\");
+    try testing.expectEqual(@as(usize, 1), S.calls);
 }

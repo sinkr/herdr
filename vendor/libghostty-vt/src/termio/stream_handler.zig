@@ -489,6 +489,11 @@ pub const StreamHandler = struct {
                 );
                 self.messageWriter(msg);
             },
+
+            // Sixel passthrough is a libghostty-vt embedder feature; the
+            // Ghostty app renders its own terminal and does not forward
+            // Sixel sequences anywhere. Memory is released by the caller.
+            .sixel => {},
         }
     }
 

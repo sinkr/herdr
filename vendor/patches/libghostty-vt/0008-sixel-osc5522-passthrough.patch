@@ -1,0 +1,666 @@
+diff --git a/vendor/libghostty-vt/include/ghostty/vt/terminal.h b/vendor/libghostty-vt/include/ghostty/vt/terminal.h
+index 6404af53254db376afce320ea5791fc64b393525..b77f6d24939c91693fea51587aab917146e5b56f 100644
+--- a/vendor/libghostty-vt/include/ghostty/vt/terminal.h
++++ b/vendor/libghostty-vt/include/ghostty/vt/terminal.h
+@@ -133,6 +133,8 @@ typedef bool (*GhosttyKittyImageSnapshotFileFn)(
+  * | `GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION`| `GhosttyTerminalDesktopNotificationFn` | Desktop notification via OSC 9 / OSC 777 |
+  * | `GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT`  | `GhosttyTerminalProgressReportFn` | Progress report via OSC 9;4               |
+  * | `GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE` | `GhosttyTerminalUnknownSequenceFn` | Unsupported sequence identifier          |
++ * | `GHOSTTY_TERMINAL_OPT_SIXEL`            | `GhosttyTerminalSixelFn`          | Complete Sixel DCS sequence (passthrough) |
++ * | `GHOSTTY_TERMINAL_OPT_OSC5522`          | `GhosttyTerminalOsc5522Fn`        | Complete OSC 5522 sequence (passthrough)  |
+  *
+  * ### Defining a write_pty callback
+  * @snippet c-vt-effects/src/main.c effects-write-pty
+@@ -1080,6 +1082,57 @@ typedef void (*GhosttyTerminalWritePtyFn)(GhosttyTerminal terminal,
+                                           const uint8_t* data,
+                                           size_t len);
+ 
++/**
++ * Callback function type for sixel passthrough.
++ *
++ * Called when the terminal receives a complete Sixel DCS sequence
++ * (`ESC P Ps;Ps;Ps q ... ESC \`). The terminal does not decode or store
++ * Sixel data; the full re-synthesized sequence bytes are surfaced so the
++ * embedder can pass them through to an attached sixel-capable terminal.
++ * The data is only valid for the duration of the call; callers must copy
++ * it if it needs to persist. Sequences larger than an internal cap
++ * (currently 8 MiB) are dropped entirely and never surfaced truncated.
++ *
++ * @param terminal The terminal handle
++ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
++ * @param data Pointer to the complete sequence bytes
++ * @param len Length of the sequence in bytes
++ * @param row 0-based cursor row in the active screen area when the sequence started
++ * @param col 0-based cursor column in the active screen area when the sequence started
++ *
++ * @ingroup terminal
++ */
++typedef void (*GhosttyTerminalSixelFn)(GhosttyTerminal terminal,
++                                       void* userdata,
++                                       const uint8_t* data,
++                                       size_t len,
++                                       uint16_t row,
++                                       uint16_t col);
++
++/**
++ * Callback function type for OSC 5522 passthrough.
++ *
++ * Called when the terminal receives a complete OSC 5522 (kitty clipboard
++ * protocol / enhanced paste) sequence (`ESC ] 5522 ; <body> BEL` or
++ * `ESC ] 5522 ; <body> ESC \`). Installing this callback replaces native
++ * OSC 5522 clipboard handling with full re-synthesized sequence bytes for
++ * forwarding to an attached client. Set it to NULL to restore native handling. The
++ * data is only valid for the duration of the call; callers must copy it
++ * if it needs to persist. Sequences whose body exceeds an internal cap
++ * (currently 20 MiB) are dropped entirely and never surfaced truncated.
++ *
++ * @param terminal The terminal handle
++ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
++ * @param data Pointer to the complete sequence bytes
++ * @param len Length of the sequence in bytes
++ *
++ * @ingroup terminal
++ */
++typedef void (*GhosttyTerminalOsc5522Fn)(GhosttyTerminal terminal,
++                                         void* userdata,
++                                         const uint8_t* data,
++                                         size_t len);
++
+ /**
+  * Callback function type for XTVERSION.
+  *
+@@ -1528,6 +1581,10 @@ typedef enum GHOSTTY_ENUM_TYPED {
+    * Input type: size_t*
+    */
+   GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES = 36,
++  /** Complete Sixel DCS callback; NULL disables passthrough. */
++  GHOSTTY_TERMINAL_OPT_SIXEL = 42,
++  /** Complete OSC 5522 callback; NULL restores native clipboard handling. */
++  GHOSTTY_TERMINAL_OPT_OSC5522 = 43,
+ 
+   /**
+    * Set the name of the terminfo entry this terminal runs as, reported
+diff --git a/vendor/libghostty-vt/src/terminal/c/terminal.zig b/vendor/libghostty-vt/src/terminal/c/terminal.zig
+index e825183e97de259c77981b4c2b14419ebc5e2195..49f53a75d4f7d902bb8e813860626e08f0382cad 100644
+--- a/vendor/libghostty-vt/src/terminal/c/terminal.zig
++++ b/vendor/libghostty-vt/src/terminal/c/terminal.zig
+@@ -236,12 +236,12 @@ pub const ModeConfig = extern struct {
+ 
+ /// C callback state for terminal effects. Most trampolines are always
+ /// installed on the stream handler; they check these fields and no-op when
+-/// the corresponding callback is null. The unknown-sequence and
+-/// clipboard trampolines are installed dynamically to preserve their
++/// the corresponding callback is null. The unknown-sequence, clipboard,
++/// and OSC 5522 trampolines are installed dynamically to preserve their
+ /// null fast paths (for clipboard_write, a null Zig-level effect makes
+ /// Kitty clipboard writes fail up front instead of spooling a
+ /// transaction that can never commit; for clipboard_read it keeps
+-/// reads denied).
++/// reads denied; for osc5522 it preserves native clipboard handling).
+ const Effects = struct {
+     userdata: ?*anyopaque = null,
+     write_pty: ?WritePtyFn = null,
+@@ -255,6 +255,8 @@ const Effects = struct {
+     pwd_changed: ?PwdChangedFn = null,
+     progress_report: ?ProgressReportFn = null,
+     size_cb: ?SizeFn = null,
++    sixel: ?SixelFn = null,
++    osc5522: ?Osc5522Fn = null,
+     clipboard_write: ?ClipboardWriteFn = null,
+     clipboard_read: ?ClipboardReadFn = null,
+     unknown_sequence: ?UnknownSequenceFn = null,
+@@ -330,6 +332,18 @@ const Effects = struct {
+     /// mode 2048 report.
+     pub const SizeFn = *const fn (Terminal, ?*anyopaque, *size_report.Size) callconv(lib.calling_conv) bool;
+ 
++    /// C function pointer type for the sixel callback. The data is the
++    /// complete re-synthesized Sixel DCS sequence and is only valid for
++    /// the duration of the call. Row/col are the 0-based cursor cell in
++    /// the active screen area captured when the sequence started.
++    pub const SixelFn = *const fn (Terminal, ?*anyopaque, [*]const u8, usize, u16, u16) callconv(lib.calling_conv) void;
++
++    /// C function pointer type for the osc5522 callback. The data is the
++    /// complete re-synthesized OSC 5522 sequence
++    /// (`ESC ] 5522 ; <body> <terminator>`) and is only valid for the
++    /// duration of the call.
++    pub const Osc5522Fn = *const fn (Terminal, ?*anyopaque, [*]const u8, usize) callconv(lib.calling_conv) void;
++
+     /// C function pointer type for the device_attributes callback.
+     /// Returns true and fills out_attrs if attributes are available,
+     /// or returns false to silently ignore the query.
+@@ -642,6 +656,23 @@ const Effects = struct {
+         if (func(@ptrCast(wrapper), wrapper.effects.userdata, &s)) return s;
+         return null;
+     }
++
++    fn sixelTrampoline(
++        handler: *Handler,
++        data: []const u8,
++        row: size.CellCountInt,
++        col: size.CellCountInt,
++    ) void {
++        const wrapper = TerminalWrapper.fromHandler(handler);
++        const func = wrapper.effects.sixel orelse return;
++        func(@ptrCast(wrapper), wrapper.effects.userdata, data.ptr, data.len, row, col);
++    }
++
++    fn osc5522Trampoline(handler: *Handler, data: []const u8) void {
++        const wrapper = TerminalWrapper.fromHandler(handler);
++        const func = wrapper.effects.osc5522 orelse return;
++        func(@ptrCast(wrapper), wrapper.effects.userdata, data.ptr, data.len);
++    }
+ };
+ 
+ /// C: GhosttyTerminal
+@@ -684,10 +715,12 @@ fn wrap(
+         .pwd_changed = &Effects.pwdChangedTrampoline,
+         .progress_report = &Effects.progressReportTrampoline,
+         .size = &Effects.sizeTrampoline,
++        .sixel = &Effects.sixelTrampoline,
+ 
+         // Installed dynamically when the callback is set; see Effects.
+         .clipboard_write = null,
+         .clipboard_read = null,
++        .osc5522 = null,
+     };
+ 
+     wrapper.* = .{
+@@ -1181,6 +1214,8 @@ pub const Option = enum(c_int) {
+     mode = 34,
+     unknown_sequence = 35,
+     unknown_max_bytes = 36,
++    sixel = 42,
++    osc5522 = 43,
+     terminfo_name = 37,
+     clipboard_read = 38,
+     clipboard_write_max_bytes = 39,
+@@ -1207,6 +1242,8 @@ pub const Option = enum(c_int) {
+             .clipboard_read => ?Effects.ClipboardReadFn,
+             .unknown_sequence => ?Effects.UnknownSequenceFn,
+             .title, .pwd, .terminfo_name => ?*const lib.String,
++            .sixel => ?Effects.SixelFn,
++            .osc5522 => ?Effects.Osc5522Fn,
+             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
+             .color_palette => ?*const color.PaletteC,
+             .kitty_image_storage_limit => ?*const u64,
+@@ -1310,6 +1347,18 @@ fn setTyped(
+             ptr.*
+         else
+             false,
++        .sixel => wrapper.effects.sixel = value,
++        .osc5522 => {
++            wrapper.effects.osc5522 = value;
++            wrapper.stream.handler.effects.osc5522 = if (value != null)
++                &Effects.osc5522Trampoline
++            else
++                null;
++            wrapper.stream.parser.osc_parser.max_bytes_5522 = if (value != null)
++                20 * 1024 * 1024
++            else
++                null;
++        },
+         .title => {
+             const str = if (value) |v| v.ptr[0..v.len] else "";
+             wrapper.terminal.setTitle(str) catch return .out_of_memory;
+diff --git a/vendor/libghostty-vt/src/terminal/dcs.zig b/vendor/libghostty-vt/src/terminal/dcs.zig
+index a76ab31baf67f5736bf9862cd23a02c4aee0e103..dd6f74cdc902d26ddead89c8e11f33225b334f39 100644
+--- a/vendor/libghostty-vt/src/terminal/dcs.zig
++++ b/vendor/libghostty-vt/src/terminal/dcs.zig
+@@ -18,6 +18,12 @@ pub const Handler = struct {
+     /// This is arbitrarily set to 1MB today, increase if needed.
+     max_bytes: usize = 1024 * 1024,
+ 
++    /// Maximum bytes a Sixel passthrough sequence can accumulate. Sixel
++    /// image payloads are much larger than other DCS commands, so they
++    /// get a dedicated, larger cap. Sequences that exceed the cap are
++    /// dropped entirely (never forwarded truncated).
++    max_bytes_sixel: usize = 8 * 1024 * 1024,
++
+     pub fn deinit(self: *Handler) void {
+         self.discard();
+     }
+@@ -74,6 +80,28 @@ pub const Handler = struct {
+                     };
+                 },
+ 
++                // Sixel graphics (DCS Ps;Ps;Ps q). The payload is not
++                // decoded; the full sequence is re-synthesized and buffered
++                // so hosts can pass it through to attached clients.
++                'q' => sixel: {
++                    var buffer: std.Io.Writer.Allocating = try .initCapacity(
++                        alloc,
++                        256, // Arbitrary choice to limit initial reallocs
++                    );
++                    errdefer buffer.deinit();
++
++                    // Re-synthesize the introducer so unhook can surface
++                    // the complete sequence bytes.
++                    try buffer.writer.writeAll("\x1bP");
++                    for (dcs.params, 0..) |param, i| {
++                        if (i > 0) try buffer.writer.writeByte(';');
++                        try buffer.writer.print("{d}", .{param});
++                    }
++                    try buffer.writer.writeByte('q');
++
++                    break :sixel .{ .state = .{ .sixel = buffer } };
++                },
++
+                 else => null,
+             },
+ 
+@@ -141,6 +169,14 @@ pub const Handler = struct {
+                 try list.writer.writeByte(byte);
+             },
+ 
++            .sixel => |*list| {
++                if (list.written().len >= self.max_bytes_sixel) {
++                    return error.OutOfMemory;
++                }
++
++                try list.writer.writeByte(byte);
++            },
++
+             .decrqss => |*buffer| {
+                 if (buffer.len >= buffer.data.len) {
+                     return error.OutOfMemory;
+@@ -178,6 +214,20 @@ pub const Handler = struct {
+                 break :xtgettcap .{ .xtgettcap = .{ .data = list.* } };
+             },
+ 
++            .sixel => |*list| sixel: {
++                // Note: purposely do not deinit our state here because
++                // we transfer ownership into the resulting command.
++                list.writer.writeAll("\x1b\\") catch {
++                    // Terminating the sequence failed (allocation); drop
++                    // the whole emission rather than forward a truncated
++                    // sequence.
++                    var owned = list.*;
++                    owned.deinit();
++                    break :sixel null;
++                };
++                break :sixel .{ .sixel = .{ .data = list.* } };
++            },
++
+             .decrqss => |buffer| .{ .decrqss = switch (buffer.len) {
+                 0 => .none,
+                 1 => switch (buffer.data[0]) {
+@@ -211,6 +261,9 @@ pub const Command = union(enum) {
+     /// DECRQSS
+     decrqss: DECRQSS,
+ 
++    /// Sixel graphics passthrough
++    sixel: Sixel,
++
+     /// Tmux control mode
+     tmux: if (build_options.tmux_control_mode)
+         terminal.tmux.ControlNotification
+@@ -221,6 +274,7 @@ pub const Command = union(enum) {
+         switch (self.*) {
+             .xtgettcap => |*v| v.data.deinit(),
+             .decrqss => {},
++            .sixel => |*v| v.data.deinit(),
+             .tmux => {},
+         }
+     }
+@@ -247,6 +301,18 @@ pub const Command = union(enum) {
+         }
+     };
+ 
++    /// Sixel graphics passthrough. The data is the complete re-synthesized
++    /// DCS sequence (`ESC P <params> q <payload> ESC \`), suitable for
++    /// writing verbatim to a sixel-capable terminal. The payload is NOT
++    /// decoded or validated beyond DCS framing.
++    pub const Sixel = struct {
++        data: std.Io.Writer.Allocating,
++
++        pub fn bytes(self: *Sixel) []const u8 {
++            return self.data.written();
++        }
++    };
++
+     /// Supported DECRQSS settings
+     pub const DECRQSS = enum {
+         none,
+@@ -325,6 +391,10 @@ const State = union(enum) {
+     /// XTGETTCAP
+     xtgettcap: std.Io.Writer.Allocating,
+ 
++    /// Sixel graphics passthrough. Accumulates the full re-synthesized
++    /// sequence bytes.
++    sixel: std.Io.Writer.Allocating,
++
+     /// DECRQSS
+     decrqss: struct {
+         data: [2]u8 = undefined,
+@@ -344,6 +414,7 @@ const State = union(enum) {
+             => {},
+ 
+             .xtgettcap => |*v| v.deinit(),
++            .sixel => |*v| v.deinit(),
+             .decrqss => {},
+             .tmux => |*v| if (comptime build_options.tmux_control_mode) {
+                 v.deinit();
+@@ -569,3 +640,47 @@ test "tmux enter and implicit exit" {
+         try testing.expect(cmd.tmux == .exit);
+     }
+ }
++
++test "sixel passthrough reconstructs full sequence" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var h: Handler = .{};
++    defer h.deinit();
++    try testing.expect(h.hook(alloc, .{ .params = &.{ 0, 0, 8 }, .final = 'q' }) == null);
++    for ("\"1;1;4;4#0;2;0;0;0#0!4~") |byte| _ = h.put(byte);
++    var cmd = h.unhook().?;
++    defer cmd.deinit();
++    try testing.expect(cmd == .sixel);
++    try testing.expectEqualStrings(
++        "\x1bP0;0;8q\"1;1;4;4#0;2;0;0;0#0!4~\x1b\\",
++        cmd.sixel.bytes(),
++    );
++}
++
++test "sixel passthrough without params" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var h: Handler = .{};
++    defer h.deinit();
++    try testing.expect(h.hook(alloc, .{ .final = 'q' }) == null);
++    for ("#0~") |byte| _ = h.put(byte);
++    var cmd = h.unhook().?;
++    defer cmd.deinit();
++    try testing.expect(cmd == .sixel);
++    try testing.expectEqualStrings("\x1bPq#0~\x1b\\", cmd.sixel.bytes());
++}
++
++test "sixel passthrough over cap is dropped entirely" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var h: Handler = .{ .max_bytes_sixel = 16 };
++    defer h.deinit();
++    try testing.expect(h.hook(alloc, .{ .params = &.{ 0, 0, 8 }, .final = 'q' }) == null);
++    for ("#0;2;0;0;0#0!200~-!200~") |byte| _ = h.put(byte);
++    try testing.expect(h.state == .ignore);
++    try testing.expect(h.unhook() == null);
++    try testing.expect(h.state == .inactive);
++}
+diff --git a/vendor/libghostty-vt/src/terminal/osc.zig b/vendor/libghostty-vt/src/terminal/osc.zig
+index dbc35492ab9751f75bfc400bfa5a98513a016439..e6b609ec43168f4fda4ca07725d01966c3159cec 100644
+--- a/vendor/libghostty-vt/src/terminal/osc.zig
++++ b/vendor/libghostty-vt/src/terminal/osc.zig
+@@ -321,6 +321,10 @@ pub const Parser = struct {
+     /// smaller policy than the default.
+     max_allocating_bytes: usize,
+ 
++    /// Optional OSC 5522 capture limit for passthrough embedders. Native
++    /// clipboard handling uses max_allocating_bytes unless overridden.
++    max_bytes_5522: ?usize = null,
++
+     /// Current state of the parser.
+     state: State,
+ 
+@@ -616,7 +620,10 @@ pub const Parser = struct {
+                 Capture.allocating(
+                     &self.capture,
+                     alloc,
+-                    self.max_allocating_bytes,
++                    if (self.state == .@"5522")
++                        self.max_bytes_5522 orelse self.max_allocating_bytes
++                    else
++                        self.max_allocating_bytes,
+                 ) catch {
+                     // The allocator failed for some reason, fall back to a fixed buffer
+                     // and hope that it's big enough.
+diff --git a/vendor/libghostty-vt/src/terminal/stream_terminal.zig b/vendor/libghostty-vt/src/terminal/stream_terminal.zig
+index 61172423a61764e3fe3e89c3ba2d75e24c039c64..57b057dae4a5287edb8d5c6b1c9156da4bec2f0c 100644
+--- a/vendor/libghostty-vt/src/terminal/stream_terminal.zig
++++ b/vendor/libghostty-vt/src/terminal/stream_terminal.zig
+@@ -19,6 +19,7 @@ const kitty_clipboard = @import("kitty/clipboard.zig");
+ const kitty_color = @import("kitty/color.zig");
+ const paste_pkg = @import("paste.zig");
+ const kitty_dnd = @import("kitty/dnd.zig");
++const size = @import("size.zig");
+ const size_report = @import("size_report.zig");
+ const simd = @import("../simd/main.zig");
+ const terminfo = @import("../terminfo/main.zig");
+@@ -72,9 +73,13 @@ pub const Handler = struct {
+     /// the kitty graphics protocol.
+     apc_handler: apc.Handler = .{},
+ 
+-    /// The DCS command handler maintains state for DCS queries.
++    /// The DCS command handler maintains state for queries and Sixel passthrough.
+     dcs_handler: dcs.Handler = .{},
+ 
++    /// Cursor cell in the active screen captured at DCS hook time.
++    sixel_hook_x: size.CellCountInt = 0,
++    sixel_hook_y: size.CellCountInt = 0,
++
+     /// The in-flight Kitty clipboard protocol (OSC 5522) write
+     /// transaction, if any. Null means no transaction is active.
+     /// Heap-allocated since transactions are rare and short-lived.
+@@ -201,6 +206,27 @@ pub const Handler = struct {
+         /// is 256 bytes; longer strings will be silently ignored.
+         xtversion: ?*const fn (*Handler) []const u8,
+ 
++        /// Called when a complete Sixel DCS sequence has been received.
++        /// The data is the full re-synthesized sequence
++        /// (`ESC P <params> q <payload> ESC \`) and is only valid for the
++        /// duration of the call. The row/col are the 0-based cursor cell
++        /// in the active screen area captured when the sequence started.
++        ///
++        /// The terminal does NOT decode or store Sixel data; this effect
++        /// exists so embedders can pass the sequence through to an
++        /// attached sixel-capable terminal.
++        sixel: ?*const fn (*Handler, data: []const u8, row: size.CellCountInt, col: size.CellCountInt) void,
++
++        /// Called when a complete OSC 5522 (kitty clipboard protocol /
++        /// enhanced paste) sequence has been received. The data is the
++        /// full re-synthesized sequence (`ESC ] 5522 ; <body> <terminator>`)
++        /// and is only valid for the duration of the call.
++        ///
++        /// When set, this replaces native OSC 5522 clipboard handling so
++        /// an attached client can implement the protocol without duplicate
++        /// responses. Null preserves the native clipboard effects.
++        osc5522: ?*const fn (*Handler, data: []const u8) void,
++
+         /// No effects means that the stream effectively becomes readonly
+         /// that only affects pure terminal state and ignores all side
+         /// effects beyond that.
+@@ -215,6 +241,8 @@ pub const Handler = struct {
+             .enquiry = null,
+             .progress_report = null,
+             .size = null,
++            .sixel = null,
++            .osc5522 = null,
+             .title_changed = null,
+             .pwd_changed = null,
+             .write_pty = null,
+@@ -529,6 +557,8 @@ pub const Handler = struct {
+     }
+ 
+     fn dcsHook(self: *Handler, value: Action.Value(.dcs_hook)) !void {
++        self.sixel_hook_x = self.terminal.screens.active.cursor.x;
++        self.sixel_hook_y = self.terminal.screens.active.cursor.y;
+         var cmd = self.dcs_handler.hook(
+             self.terminal.gpa(),
+             value,
+@@ -551,6 +581,11 @@ pub const Handler = struct {
+ 
+     fn dcsCommand(self: *Handler, cmd: *dcs.Command) !void {
+         switch (cmd.*) {
++            .sixel => |*sixel| {
++                const func = self.effects.sixel orelse return;
++                func(self, sixel.bytes(), self.sixel_hook_y, self.sixel_hook_x);
++            },
++
+             .decrqss => |request| {
+                 var response: [
+                     dcs.Command.DECRQSS.max_response_bytes + 1
+@@ -608,6 +643,26 @@ pub const Handler = struct {
+         ) catch unreachable);
+     }
+ 
++    /// Forward an OSC 5522 packet without interpreting clipboard metadata.
++    fn oscKittyClipboard(self: *Handler, v: Action.KittyClipboard) !void {
++        const func = self.effects.osc5522 orelse return;
++
++        var aw: std.Io.Writer.Allocating = try .initCapacity(
++            self.terminal.gpa(),
++            "\x1b]5522;".len + v.metadata.len +
++                (if (v.payload) |p| p.len + 1 else 0) + 2,
++        );
++        defer aw.deinit();
++        try aw.writer.writeAll("\x1b]5522;");
++        try aw.writer.writeAll(v.metadata);
++        if (v.payload) |payload| {
++            try aw.writer.writeByte(';');
++            try aw.writer.writeAll(payload);
++        }
++        try aw.writer.writeAll(v.terminator.string());
++        func(self, aw.written());
++    }
++
+     fn bell(self: *Handler) void {
+         const func = self.effects.bell orelse return;
+         func(self);
+@@ -789,6 +844,12 @@ pub const Handler = struct {
+         self: *Handler,
+         v: Action.Value(.kitty_clipboard),
+     ) error{OutOfMemory}!void {
++        if (self.effects.osc5522 != null) {
++            // Switching to passthrough abandons any native write transaction.
++            self.kittyClipboardAbort();
++            return self.oscKittyClipboard(v) catch return error.OutOfMemory;
++        }
++
+         // Decode and validate the metadata.
+         var arena: std.heap.ArenaAllocator = .init(self.terminal.gpa());
+         defer arena.deinit();
+@@ -6536,3 +6597,107 @@ test "full reset drops kitty clipboard grants" {
+     try testing.expect(!S.last_read_granted);
+     try s.handler.kitty_clipboard_grants.grant(testing.allocator, "pw", .read, false);
+ }
++
++test "osc5522 effect surfaces full sequence once with BEL terminator" {
++    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
++    defer t.deinit(testing.allocator);
++
++    const S = struct {
++        var calls: usize = 0;
++        var captured: ?[]const u8 = null;
++        fn osc5522(_: *Handler, data: []const u8) void {
++            calls += 1;
++            if (captured) |old| testing.allocator.free(old);
++            captured = testing.allocator.dupe(u8, data) catch @panic("OOM");
++        }
++    };
++    S.calls = 0;
++    S.captured = null;
++    defer if (S.captured) |old| testing.allocator.free(old);
++
++    var handler: Handler = .init(&t);
++    handler.effects.osc5522 = &S.osc5522;
++
++    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
++    defer s.deinit();
++
++    // Metadata plus payload; the payload may itself contain ';'.
++    s.nextSlice("before\x1b]5522;type=write:mime=dGV4dA==;aGVsbG87d28=\x07after");
++    try testing.expectEqual(@as(usize, 1), S.calls);
++    try testing.expectEqualStrings(
++        "\x1b]5522;type=write:mime=dGV4dA==;aGVsbG87d28=\x07",
++        S.captured.?,
++    );
++
++    // Surrounding text still prints normally.
++    const str = try t.plainString(testing.allocator);
++    defer testing.allocator.free(str);
++    try testing.expectEqualStrings("beforeafter", str);
++}
++
++test "osc5522 effect surfaces full sequence with ST terminator" {
++    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
++    defer t.deinit(testing.allocator);
++
++    const S = struct {
++        var calls: usize = 0;
++        var captured: ?[]const u8 = null;
++        fn osc5522(_: *Handler, data: []const u8) void {
++            calls += 1;
++            if (captured) |old| testing.allocator.free(old);
++            captured = testing.allocator.dupe(u8, data) catch @panic("OOM");
++        }
++    };
++    S.calls = 0;
++    S.captured = null;
++    defer if (S.captured) |old| testing.allocator.free(old);
++
++    var handler: Handler = .init(&t);
++    handler.effects.osc5522 = &S.osc5522;
++
++    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
++    defer s.deinit();
++
++    // Metadata only (a read request), split across writes.
++    s.nextSlice("\x1b]5522;type=re");
++    try testing.expectEqual(@as(usize, 0), S.calls);
++    s.nextSlice("ad:pw=abc\x1b\\");
++    try testing.expectEqual(@as(usize, 1), S.calls);
++    try testing.expectEqualStrings("\x1b]5522;type=read:pw=abc\x1b\\", S.captured.?);
++}
++
++test "osc5522 over-cap sequence is dropped entirely" {
++    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
++    defer t.deinit(testing.allocator);
++
++    const S = struct {
++        var calls: usize = 0;
++        fn osc5522(_: *Handler, _: []const u8) void {
++            calls += 1;
++        }
++    };
++    S.calls = 0;
++
++    var handler: Handler = .init(&t);
++    handler.effects.osc5522 = &S.osc5522;
++
++    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
++    defer s.deinit();
++    s.parser.osc_parser.max_bytes_5522 = 32;
++
++    s.nextSlice("\x1b]5522;type=write;");
++    for (0..64) |_| s.next('A');
++    s.nextSlice("\x07after");
++
++    // Dropped entirely: never surfaced, not even truncated.
++    try testing.expectEqual(@as(usize, 0), S.calls);
++
++    // The terminal keeps working after the dropped sequence.
++    const str = try t.plainString(testing.allocator);
++    defer testing.allocator.free(str);
++    try testing.expectEqualStrings("after", str);
++
++    // A follow-up in-cap sequence is surfaced normally.
++    s.nextSlice("\x1b]5522;type=read\x1b\\");
++    try testing.expectEqual(@as(usize, 1), S.calls);
++}
+diff --git a/vendor/libghostty-vt/src/termio/stream_handler.zig b/vendor/libghostty-vt/src/termio/stream_handler.zig
+index 27e06dcb7c2761389b8e2a9f19d53f384528a037..bae2f33d264d4bc5db0c38c84ebf4ba5ceb402c0 100644
+--- a/vendor/libghostty-vt/src/termio/stream_handler.zig
++++ b/vendor/libghostty-vt/src/termio/stream_handler.zig
+@@ -489,6 +489,11 @@ pub const StreamHandler = struct {
+                 );
+                 self.messageWriter(msg);
+             },
++
++            // Sixel passthrough is a libghostty-vt embedder feature; the
++            // Ghostty app renders its own terminal and does not forward
++            // Sixel sequences anywhere. Memory is released by the caller.
++            .sixel => {},
+         }
+     }
+ 
