@@ -78,6 +78,10 @@ pub(super) struct ClientState {
     pub(super) draw_host_cursor: bool,
     pub(super) detached_process_children: Vec<std::process::Child>,
     pub(super) shell: Option<shell::ClientShellState>,
+    pub(super) pending_passthrough: Vec<(
+        endpoint::ClientEndpointId,
+        crate::protocol::endpoint::EndpointPassthrough,
+    )>,
 }
 
 impl Drop for ClientState {
@@ -133,6 +137,7 @@ impl ClientState {
             deferred_local_activation: None,
             draw_host_cursor: false,
             detached_process_children: Vec::new(),
+            pending_passthrough: Vec::new(),
             shell: Some(shell::ClientShellState::new(
                 shell::ClientShellConfig::from_config(&crate::config::Config::default()),
             )),
@@ -145,6 +150,7 @@ impl ClientState {
 
     pub(super) fn freeze_presentation(&mut self) {
         self.presentation_frozen = true;
+        self.pending_passthrough.clear();
     }
 
     pub(super) fn record_host_theme_update(
@@ -505,11 +511,22 @@ impl ClientState {
         let _ = self.try_present_frame(frame_data);
     }
 
+    #[cfg(test)]
     fn write_composed_output(
         &mut self,
         writer: &mut impl io::Write,
         encoded: &[u8],
+        graphics: crate::kitty_graphics::GraphicsOutput,
+    ) -> io::Result<()> {
+        self.write_composed_output_with_passthrough(writer, encoded, graphics, &[])
+    }
+
+    fn write_composed_output_with_passthrough(
+        &mut self,
+        writer: &mut impl io::Write,
+        encoded: &[u8],
         mut graphics: crate::kitty_graphics::GraphicsOutput,
+        passthrough: &[u8],
     ) -> io::Result<()> {
         if self.kitty_graphics_enabled {
             if !self.pending_native_cleanup.is_empty() {
@@ -520,14 +537,20 @@ impl ClientState {
                     ),
                 );
             }
-            frame_output::write_composed_frame(
+            frame_output::write_composed_frame_with_passthrough(
                 writer.by_ref(),
                 encoded,
                 &graphics,
                 &mut self.image_files,
+                passthrough,
             )?;
         } else {
-            writer.write_all(encoded)?;
+            frame_output::write_encoded_frame_with_passthrough(
+                writer.by_ref(),
+                encoded,
+                &[],
+                passthrough,
+            )?;
         }
         writer.flush()?;
         if self.kitty_graphics_enabled {
@@ -562,7 +585,22 @@ impl ClientState {
             self.blit_encoder.encode(&frame_data, self.repaint_pending)
         };
         let mut stdout = io::stdout();
-        if let Err(error) = self.write_composed_output(&mut stdout, &encoded.bytes, graphics) {
+        let passthrough = self
+            .shell
+            .as_ref()
+            .map(|shell| {
+                shell.take_passthrough_bytes(
+                    &mut self.pending_passthrough,
+                    (frame_data.width, frame_data.height),
+                )
+            })
+            .unwrap_or_default();
+        if let Err(error) = self.write_composed_output_with_passthrough(
+            &mut stdout,
+            &encoded.bytes,
+            graphics,
+            &passthrough,
+        ) {
             tracing::warn!(%error, "failed to present client frame");
             self.repaint_pending = true;
             return false;

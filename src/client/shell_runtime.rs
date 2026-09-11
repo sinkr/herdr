@@ -780,6 +780,18 @@ pub(super) fn finish_client_shell_input(
             // Pane input and non-focus host effects do not cross the frozen handoff boundary.
             continue;
         }
+        if matches!(&request, ClientMessage::EndpointControl { kind, .. }
+            if kind == crate::protocol::endpoint::PANE_OSC5522_KIND)
+            && !endpoints
+                .connection(endpoints.active_id())
+                .is_some_and(|connection| {
+                    connection
+                        .negotiation
+                        .supports_capability(crate::protocol::endpoint::PASSTHROUGH_CAPABILITY)
+                })
+        {
+            continue;
+        }
         write_to_server(endpoints, &request).map_err(ClientError::ConnectionLost)?;
     }
     if let Some(frame) = frame {

@@ -133,6 +133,8 @@ typedef bool (*GhosttyKittyImageSnapshotFileFn)(
  * | `GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION`| `GhosttyTerminalDesktopNotificationFn` | Desktop notification via OSC 9 / OSC 777 |
  * | `GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT`  | `GhosttyTerminalProgressReportFn` | Progress report via OSC 9;4               |
  * | `GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE` | `GhosttyTerminalUnknownSequenceFn` | Unsupported sequence identifier          |
+ * | `GHOSTTY_TERMINAL_OPT_SIXEL`            | `GhosttyTerminalSixelFn`          | Complete Sixel DCS sequence (passthrough) |
+ * | `GHOSTTY_TERMINAL_OPT_OSC5522`          | `GhosttyTerminalOsc5522Fn`        | Complete OSC 5522 sequence (passthrough)  |
  *
  * ### Defining a write_pty callback
  * @snippet c-vt-effects/src/main.c effects-write-pty
@@ -1081,6 +1083,57 @@ typedef void (*GhosttyTerminalWritePtyFn)(GhosttyTerminal terminal,
                                           size_t len);
 
 /**
+ * Callback function type for sixel passthrough.
+ *
+ * Called when the terminal receives a complete Sixel DCS sequence
+ * (`ESC P Ps;Ps;Ps q ... ESC \`). The terminal does not decode or store
+ * Sixel data; the full re-synthesized sequence bytes are surfaced so the
+ * embedder can pass them through to an attached sixel-capable terminal.
+ * The data is only valid for the duration of the call; callers must copy
+ * it if it needs to persist. Sequences larger than an internal cap
+ * (currently 8 MiB) are dropped entirely and never surfaced truncated.
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ * @param data Pointer to the complete sequence bytes
+ * @param len Length of the sequence in bytes
+ * @param row 0-based cursor row in the active screen area when the sequence started
+ * @param col 0-based cursor column in the active screen area when the sequence started
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyTerminalSixelFn)(GhosttyTerminal terminal,
+                                       void* userdata,
+                                       const uint8_t* data,
+                                       size_t len,
+                                       uint16_t row,
+                                       uint16_t col);
+
+/**
+ * Callback function type for OSC 5522 passthrough.
+ *
+ * Called when the terminal receives a complete OSC 5522 (kitty clipboard
+ * protocol / enhanced paste) sequence (`ESC ] 5522 ; <body> BEL` or
+ * `ESC ] 5522 ; <body> ESC \`). Installing this callback replaces native
+ * OSC 5522 clipboard handling with full re-synthesized sequence bytes for
+ * forwarding to an attached client. Set it to NULL to restore native handling. The
+ * data is only valid for the duration of the call; callers must copy it
+ * if it needs to persist. Sequences whose body exceeds an internal cap
+ * (currently 20 MiB) are dropped entirely and never surfaced truncated.
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ * @param data Pointer to the complete sequence bytes
+ * @param len Length of the sequence in bytes
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyTerminalOsc5522Fn)(GhosttyTerminal terminal,
+                                         void* userdata,
+                                         const uint8_t* data,
+                                         size_t len);
+
+/**
  * Callback function type for XTVERSION.
  *
  * Called when the terminal receives an XTVERSION query (CSI > q).
@@ -1586,6 +1639,10 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_PRESERVE_PNG = 40,
   /** Optional synchronous GhosttyKittyImageSnapshotFileFn; NULL disables. */
   GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_SNAPSHOT_FILE = 41,
+  /** Complete Sixel DCS callback; NULL disables passthrough. */
+  GHOSTTY_TERMINAL_OPT_SIXEL = 42,
+  /** Complete OSC 5522 callback; NULL restores native clipboard handling. */
+  GHOSTTY_TERMINAL_OPT_OSC5522 = 43,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 

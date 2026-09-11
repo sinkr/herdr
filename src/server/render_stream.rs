@@ -105,7 +105,13 @@ impl ClientRenderState {
         }
     }
 
-    pub(crate) fn prepare_frame(&mut self, frame: FrameData) -> Option<PreparedRender> {
+    /// Splices one-shot passthrough bytes into a direct terminal frame.
+    pub(crate) fn prepare_frame_with_sixels(
+        &mut self,
+        frame: FrameData,
+        sixels: &[u8],
+        osc_bytes: &[u8],
+    ) -> Option<PreparedRender> {
         match self {
             Self::Semantic { .. } => None,
             Self::TerminalAnsi {
@@ -113,7 +119,11 @@ impl ClientRenderState {
                 seq,
                 repaint_pending,
             } => {
-                if !*repaint_pending && blit_encoder.is_current(&frame) {
+                if sixels.is_empty()
+                    && osc_bytes.is_empty()
+                    && !*repaint_pending
+                    && blit_encoder.is_current(&frame)
+                {
                     crate::render_prof::event("prepare_frame.ansi.skip_current");
                     return None;
                 }
@@ -126,6 +136,10 @@ impl ClientRenderState {
                     crate::render_prof::event("prepare_frame.ansi.partial");
                 }
                 insert_graphics_before_sync_end(&mut encoded.bytes, &frame.graphics);
+                insert_graphics_before_sync_end(&mut encoded.bytes, sixels);
+                insert_graphics_before_sync_end(&mut encoded.bytes, osc_bytes);
+                crate::render_prof::counter("prepare_frame.sixel.bytes", sixels.len() as u64);
+                crate::render_prof::counter("prepare_frame.raw_osc.bytes", osc_bytes.len() as u64);
                 crate::render_prof::counter(
                     "prepare_frame.graphics.bytes",
                     frame.graphics.len() as u64,
@@ -550,6 +564,7 @@ pub(crate) fn render_tab_surface_virtual(
 }
 
 /// Renders one server-owned terminal directly for `terminal attach` clients.
+///
 pub(crate) fn render_terminal_virtual(
     runtime: &crate::terminal::TerminalRuntime,
     area: Rect,

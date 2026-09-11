@@ -117,7 +117,9 @@ pub(crate) use handshake::probe_endpoint_negotiation;
 use handshake::{client_shell_keybinding_source, do_handshake, is_remote_client_process};
 #[cfg(test)]
 use handshake::{
-    direct_graphics_profile_values, handshake_read_timeout, REMOTE_HANDSHAKE_READ_TIMEOUT,
+    direct_graphics_profile_values, geometry_passive_capability, handshake_read_timeout,
+    iip_graphics_capability, parse_da1_sixel_reply, sixel_graphics_capability, FORCE_IIP_ENV_VAR,
+    FORCE_SIXEL_ENV_VAR, REMOTE_HANDSHAKE_READ_TIMEOUT, VIEWER_ENV_VAR,
 };
 use notifications::{handle_notify, handle_shell_notification_effects};
 #[cfg(test)]
@@ -230,6 +232,9 @@ fn run_client_with_mode(
     // Get the terminal geometry before handshake (before raw mode).
     let (cols, rows, cell_width_px, cell_height_px, exact_cell_size) =
         initial_terminal_geometry(pixel_geometry_enabled, kitty_graphics_enabled)?;
+    if client_rendered_shell {
+        handshake::initialize_host_graphics(kitty_graphics_enabled);
+    }
 
     let shell_surface_size = loop_config
         .shell_config
@@ -265,6 +270,15 @@ fn run_client_with_mode(
                 ));
             }
             if let Some((terminal_id, takeover)) = attach_request {
+                if handshake::geometry_passive_capability() {
+                    write_to_server(
+                        &mut stream,
+                        &ClientMessage::EndpointControl {
+                            kind: crate::protocol::endpoint::VIEWER_KIND.into(),
+                            data: r#"{"geometry_passive":true}"#.into(),
+                        },
+                    )?;
+                }
                 write_to_server(
                     &mut stream,
                     &ClientMessage::AttachTerminal {
@@ -459,6 +473,7 @@ async fn run_client_loop(
         draw_host_cursor,
         detached_process_children: Vec::new(),
         shell: config.shell_config.map(shell::ClientShellState::new),
+        pending_passthrough: Vec::new(),
     };
     let mut federated = endpoint_catalog.has_enabled_ssh();
     if let Some(shell) = state.shell.as_mut() {
@@ -576,11 +591,8 @@ async fn run_client_loop(
     });
 
     let mut write_stream = if let Some((stream, handshake)) = initial {
-        let max_frame_size = if state.kitty_graphics_enabled {
-            MAX_GRAPHICS_FRAME_SIZE
-        } else {
-            crate::protocol::MAX_FRAME_SIZE
-        };
+        // Passthrough payloads are independent of native Kitty graphics.
+        let max_frame_size = MAX_GRAPHICS_FRAME_SIZE;
         let negotiation = endpoint::EndpointNegotiation::new(
             handshake.endpoint_methods.unwrap_or_default(),
             handshake.endpoint_capabilities.unwrap_or_default(),
@@ -1982,6 +1994,32 @@ async fn run_client_loop(
                         }
                     }
                     ServerMessage::EndpointControl { kind, data } => {
+                        if kind == crate::protocol::endpoint::PASSTHROUGH_KIND {
+                            if !endpoint_active && !activation_message {
+                                continue;
+                            }
+                            match serde_json::from_str(&data) {
+                                Ok(emissions) => {
+                                    state
+                                        .pending_passthrough
+                                        .push((endpoint_id.clone(), emissions));
+                                    if endpoint_active && !state.presentation_frozen {
+                                        if let Some(frame) =
+                                            state.shell.as_mut().and_then(|shell| {
+                                                shell.compose(
+                                                    state.reported_size.0,
+                                                    state.reported_size.1,
+                                                )
+                                            })
+                                        {
+                                            state.present_frame(frame);
+                                        }
+                                    }
+                                }
+                                Err(error) => warn!(%error, "invalid endpoint passthrough"),
+                            }
+                            continue;
+                        }
                         if kind == crate::protocol::endpoint::PRESENTATION_EFFECTS_READY_KIND {
                             let progress = pending_activation.as_mut().map(|activation| {
                                 activation.receive_presentation_effects_ready(

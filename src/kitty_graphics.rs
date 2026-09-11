@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
@@ -121,12 +122,652 @@ pub(crate) fn is_enabled() -> bool {
     KITTY_GRAPHICS_ENABLED.load(Ordering::Acquire)
 }
 
+thread_local! {
+    /// Render-scoped override of [`is_enabled`] for placeholder blanking.
+    /// Installed per client render by the headless server so each attached
+    /// client can independently hide Kitty Unicode placeholder glyphs
+    /// (native Kitty replay and Sixel transcode both need them blanked).
+    static HIDE_PLACEHOLDERS_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// RAII scope for the per-render placeholder-hiding value. Restores the
+/// previous value on drop so nested renders behave.
+pub(crate) struct PlaceholderHidingGuard {
+    previous: Option<bool>,
+}
+
+/// Installs `hide` as the placeholder-hiding value for the current render
+/// (current thread) until the returned guard drops. Pane renders read it
+/// through [`placeholders_hidden`].
+#[must_use = "the override lasts only while the guard is alive"]
+pub(crate) fn hide_placeholders_for_render(hide: bool) -> PlaceholderHidingGuard {
+    let previous = HIDE_PLACEHOLDERS_OVERRIDE.with(|cell| cell.replace(Some(hide)));
+    PlaceholderHidingGuard { previous }
+}
+
+impl Drop for PlaceholderHidingGuard {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        HIDE_PLACEHOLDERS_OVERRIDE.with(|cell| cell.set(previous));
+    }
+}
+
+/// Whether the current render should blank Kitty Unicode placeholder
+/// glyphs. Uses the render-scoped override when one is installed (server
+/// per-client renders), else the process-global flag (local TUI path).
+pub(crate) fn placeholders_hidden() -> bool {
+    HIDE_PLACEHOLDERS_OVERRIDE
+        .with(Cell::get)
+        .unwrap_or_else(is_enabled)
+}
+
+/// True when a frame cell's symbol renders the Kitty Unicode placeholder
+/// (U+10EEEE as the grapheme base, optionally followed by the row/col
+/// diacritics). Shared detection for render-time blanking and
+/// post-render scrubbing.
+pub(crate) fn is_placeholder_symbol(symbol: &str) -> bool {
+    symbol.chars().next().map(u32::from) == Some(crate::ghostty::KITTY_UNICODE_PLACEHOLDER)
+}
+
+/// Blanks every Kitty Unicode placeholder cell in `frame`, in place.
+///
+/// Placeholder cells only make sense while the graphics payload that
+/// fills them is delivered. When a frame's graphics are dropped for
+/// exceeding the per-frame budget, the placeholders would otherwise ship
+/// to the client and render as naked glyph soup across the placement
+/// area. Each placeholder cell becomes a plain space keeping its
+/// background color; the foreground color and modifiers are reset because
+/// they encode the image id and diacritic routing, not styling.
+pub(crate) fn blank_placeholder_cells(frame: &mut crate::protocol::FrameData) {
+    for cell in &mut frame.cells {
+        if is_placeholder_symbol(&cell.symbol) {
+            cell.symbol.clear();
+            cell.symbol.push(' ');
+            cell.fg = 0;
+            cell.modifier = 0;
+            cell.hyperlink = None;
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct EncodedGraphics {
     pub(crate) bytes: Vec<u8>,
     pub(crate) incomplete: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Kitty→Sixel transcode for Sixel-capable non-Kitty clients
+// ---------------------------------------------------------------------------
+
+/// Cell size assumed for Sixel transcode when the client reported none
+/// (Sixel clients disable Kitty graphics, so their Hello carries 0×0).
+const SIXEL_FALLBACK_CELL: HostCellSize = HostCellSize {
+    width_px: 9,
+    height_px: 18,
+};
+
+/// Budget slack per transcoded splice, matching the passthrough estimate.
+const SIXEL_TRANSCODE_SPLICE_SLACK: usize = 32;
+
+/// One tracked transcoded placement: what image bytes were encoded and
+/// where the emission landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscodedPlacement {
+    image: ImageSignature,
+    placement: PlacementSignature,
+}
+
+/// Replacement signature state for one pane after a transcode pass.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PaneTranscodeState(HashMap<(u32, u32), TranscodedPlacement>);
+
+impl PaneTranscodeState {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Per-client Kitty→Sixel transcode state: for every pane, the signatures
+/// of the placements whose Sixel emissions this client last received.
+/// Mirrors the change-tracking role [`HostGraphicsCache`] plays for native
+/// Kitty replay.
+#[derive(Debug, Default)]
+pub(crate) struct SixelTranscodeCache {
+    panes: HashMap<PaneId, PaneTranscodeState>,
+}
+
+impl SixelTranscodeCache {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.panes.is_empty()
+    }
+
+    fn pane(&self, pane_id: PaneId) -> Option<&PaneTranscodeState> {
+        self.panes.get(&pane_id)
+    }
+
+    /// Pane ids with tracked transcode state. Panes that leave the
+    /// rendered view must have their state cleared (their on-screen tiles
+    /// were overdrawn), so returning placements re-emit as additions.
+    pub(crate) fn tracked_panes(&self) -> Vec<PaneId> {
+        self.panes.keys().copied().collect()
+    }
+
+    /// Commits a pane's replacement state after the frame carrying its
+    /// emissions was delivered (or skipped with none pending).
+    pub(crate) fn commit(&mut self, pane_id: PaneId, state: PaneTranscodeState) {
+        if state.is_empty() {
+            self.panes.remove(&pane_id);
+        } else {
+            self.panes.insert(pane_id, state);
+        }
+    }
+}
+
+/// Outcome of one pane's transcode pass for one client.
+pub(crate) struct SixelTranscodeOutcome {
+    /// Positioned splices to ride the frame (pane-local `row`/`col`).
+    pub(crate) splices: Vec<crate::protocol::SixelSplice>,
+    /// Replacement signature state; commit via
+    /// [`SixelTranscodeCache::commit`] only once the carrying frame was
+    /// sent (mirrors the passthrough watermark discipline).
+    pub(crate) state: PaneTranscodeState,
+}
+
+/// RGBA pixels of one Kitty image prepared for Sixel encoding.
+struct PreparedImage {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+fn prepare_image(placement: &KittyImagePlacement) -> Option<PreparedImage> {
+    match placement.format {
+        KittyImageFormat::Rgba => Some(PreparedImage {
+            rgba: placement.data.clone(),
+            width: placement.image_width,
+            height: placement.image_height,
+        }),
+        KittyImageFormat::Rgb => Some(PreparedImage {
+            rgba: crate::sixel_encode::rgb_to_rgba(&placement.data),
+            width: placement.image_width,
+            height: placement.image_height,
+        }),
+        KittyImageFormat::Png => {
+            let decoded = crate::ghostty::decode_png_rgba(&placement.data)?;
+            Some(PreparedImage {
+                rgba: decoded.data,
+                width: decoded.width,
+                height: decoded.height,
+            })
+        }
+    }
+}
+
+/// Gathers one pane's Kitty placement changes for one Sixel client.
+///
+/// Walks the pane's current placements (regular and Unicode-placeholder
+/// virtual runs), diffs their image + geometry signatures against
+/// `previous`, and encodes added or changed placements into positioned
+/// [`crate::protocol::SixelSplice`] records via the shared `encode_cache`.
+///
+/// `used_bytes` accumulates against `budget_bytes` (shared with Sixel
+/// passthrough); placements that would exceed the budget keep their old
+/// signature entry so they retry on the next frame. A single emission
+/// larger than the whole budget is dropped permanently (its signature is
+/// committed), mirroring the passthrough oversized-emission convention.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_pane_sixel_transcodes(
+    runtime: &crate::terminal::TerminalRuntime,
+    pane_id: PaneId,
+    pane_rect: Rect,
+    client_cell_size: HostCellSize,
+    previous: Option<&SixelTranscodeCache>,
+    encode_cache: &mut crate::sixel_encode::SixelEncodeCache,
+    used_bytes: &mut usize,
+    budget_bytes: usize,
+) -> SixelTranscodeOutcome {
+    let cell_size = if client_cell_size.is_known() {
+        client_cell_size
+    } else {
+        SIXEL_FALLBACK_CELL
+    };
+    let previous = previous.and_then(|cache| cache.pane(pane_id));
+    let scrollback_offset = runtime
+        .scroll_metrics()
+        .map(|m| m.offset_from_bottom as u32)
+        .unwrap_or(0);
+
+    // Pass 1: geometry only — no image data copies.
+    let placements = runtime.kitty_image_placements_with_data_filter(|_| false);
+    if placements.is_empty() {
+        return SixelTranscodeOutcome {
+            splices: Vec::new(),
+            state: PaneTranscodeState::default(),
+        };
+    }
+
+    struct Resolved {
+        key: (u32, u32),
+        tracked: TranscodedPlacement,
+        encode_key: crate::sixel_encode::SixelEncodeKey,
+        source: (u32, u32, u32, u32),
+        target: (u32, u32),
+        row: u16,
+        col: u16,
+        data_fingerprint: u64,
+        changed: bool,
+    }
+
+    let mut resolved = Vec::with_capacity(placements.len());
+    for placement in &placements {
+        let host_placement = HostPlacement {
+            raw_data: None,
+            pane_id,
+            host_image_id: None,
+            area: pane_rect,
+            cell_size,
+            source_key: HostSourceKey::Terminal {
+                pane_id,
+                image_id: placement.image_id,
+            },
+            placement: placement.clone(),
+            scrollback_offset,
+        };
+        let Some((clipped, format_code)) = clipped_placement(&host_placement) else {
+            continue;
+        };
+        let image = image_signature(&host_placement, format_code);
+        let placement_sig = placement_signature(clipped, placement.z, scrollback_offset);
+        let key = (placement.image_id, placement.placement_id);
+        let tracked = TranscodedPlacement {
+            image,
+            placement: placement_sig,
+        };
+        let changed = previous.and_then(|state| state.0.get(&key)).copied() != Some(tracked);
+        let source = (
+            clipped.source_x,
+            clipped.source_y,
+            clipped.source_width,
+            clipped.source_height,
+        );
+        let target = (
+            clipped.cols.saturating_mul(cell_size.width_px).max(1),
+            clipped.rows.saturating_mul(cell_size.height_px).max(1),
+        );
+        resolved.push(Resolved {
+            key,
+            tracked,
+            encode_key: crate::sixel_encode::SixelEncodeKey {
+                data_fingerprint: placement.data_fingerprint,
+                data_len: placement.data_len,
+                source,
+                target,
+            },
+            source,
+            target,
+            row: clipped.y - pane_rect.y,
+            col: clipped.x - pane_rect.x,
+            data_fingerprint: placement.data_fingerprint,
+            changed,
+        });
+    }
+
+    // Pass 2: fetch image bytes only for changed placements whose encode is
+    // not already cached.
+    let needed: HashSet<u64> = resolved
+        .iter()
+        .filter(|entry| entry.changed && !encode_cache.contains(&entry.encode_key))
+        .map(|entry| entry.data_fingerprint)
+        .collect();
+    let mut prepared: HashMap<u64, Option<PreparedImage>> = HashMap::new();
+    if !needed.is_empty() {
+        for placement in runtime
+            .kitty_image_placements_with_data_filter(|d| needed.contains(&d.data_fingerprint))
+        {
+            if placement.data.is_empty() {
+                continue;
+            }
+            prepared
+                .entry(placement.data_fingerprint)
+                .or_insert_with(|| prepare_image(&placement));
+        }
+    }
+
+    let mut splices = Vec::new();
+    let mut state = PaneTranscodeState::default();
+    for entry in resolved {
+        if !entry.changed {
+            state.0.insert(entry.key, entry.tracked);
+            continue;
+        }
+        let encoded = match encode_cache.get(&entry.encode_key) {
+            Some(encoded) => Some(encoded),
+            None => match prepared.get(&entry.data_fingerprint) {
+                Some(Some(image)) => {
+                    let (sx, sy, sw, sh) = entry.source;
+                    let encoded = crate::sixel_encode::crop_rgba(
+                        &image.rgba,
+                        image.width,
+                        image.height,
+                        sx,
+                        sy,
+                        sw,
+                        sh,
+                    )
+                    .map(|(cropped, cw, ch)| {
+                        crate::sixel_encode::encode_sixel_rgba(
+                            &cropped,
+                            cw,
+                            ch,
+                            entry.target.0,
+                            entry.target.1,
+                        )
+                    })
+                    .unwrap_or_default();
+                    encode_cache.insert(entry.encode_key, encoded.clone());
+                    Some(encoded)
+                }
+                // Png decode failure: permanent for these bytes — commit
+                // the signature so it is not retried every frame.
+                Some(None) => {
+                    state.0.insert(entry.key, entry.tracked);
+                    continue;
+                }
+                // Data unavailable this pass (image raced away): leave the
+                // old signature in place so the placement retries.
+                None => {
+                    if let Some(old) = previous.and_then(|state| state.0.get(&entry.key)) {
+                        state.0.insert(entry.key, *old);
+                    }
+                    continue;
+                }
+            },
+        };
+        let Some(encoded) = encoded else { continue };
+        if encoded.is_empty() {
+            state.0.insert(entry.key, entry.tracked);
+            continue;
+        }
+        let cost = encoded.len() + SIXEL_TRANSCODE_SPLICE_SLACK;
+        if cost > budget_bytes {
+            tracing::warn!(
+                pane = pane_id.raw(),
+                bytes = encoded.len(),
+                budget = budget_bytes,
+                "dropping oversized sixel transcode emission"
+            );
+            state.0.insert(entry.key, entry.tracked);
+            continue;
+        }
+        if *used_bytes + cost > budget_bytes {
+            // Over budget this frame: keep the previous signature (or
+            // none) so the placement re-diffs as changed next frame.
+            if let Some(old) = previous.and_then(|state| state.0.get(&entry.key)) {
+                state.0.insert(entry.key, *old);
+            }
+            continue;
+        }
+        *used_bytes += cost;
+        splices.push(crate::protocol::SixelSplice {
+            pane_id: pane_id.raw(),
+            rect: crate::protocol::SixelPaneRect {
+                x: pane_rect.x,
+                y: pane_rect.y,
+                width: pane_rect.width,
+                height: pane_rect.height,
+            },
+            row: entry.row,
+            col: entry.col,
+            data: encoded,
+        });
+        state.0.insert(entry.key, entry.tracked);
+    }
+
+    SixelTranscodeOutcome { splices, state }
+}
+
+/// Gathers one pane's Kitty placement changes for one IIP client.
+///
+/// Sibling of [`collect_pane_sixel_transcodes`] with identical signature
+/// diffing, caching, and budget discipline, but emissions are OSC 1337
+/// IIP sequences built via [`crate::iip_encode::encode_iip`]. Png
+/// placements whose source rect covers the whole image (and stay within
+/// 16 Mpx) pass their file bytes through untouched; everything else runs
+/// the RGBA prepare/crop path and gets PNG-encoded. IIP sizes emissions
+/// in cells, so the encode cache key's `target` is the clipped cell rect
+/// rather than pixels.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_pane_iip_transcodes(
+    runtime: &crate::terminal::TerminalRuntime,
+    pane_id: PaneId,
+    pane_rect: Rect,
+    client_cell_size: HostCellSize,
+    previous: Option<&SixelTranscodeCache>,
+    encode_cache: &mut crate::sixel_encode::SixelEncodeCache,
+    used_bytes: &mut usize,
+    budget_bytes: usize,
+) -> SixelTranscodeOutcome {
+    /// Intrinsic pixel ceiling for raw PNG passthrough: the client's
+    /// pixelLimit (16'777'216) drops larger images silently, and the
+    /// Rgba encode path downscales to fit instead.
+    const IIP_PNG_PASSTHROUGH_MAX_PIXELS: u64 = 16_000_000;
+
+    let cell_size = if client_cell_size.is_known() {
+        client_cell_size
+    } else {
+        SIXEL_FALLBACK_CELL
+    };
+    let previous = previous.and_then(|cache| cache.pane(pane_id));
+    let scrollback_offset = runtime
+        .scroll_metrics()
+        .map(|m| m.offset_from_bottom as u32)
+        .unwrap_or(0);
+
+    // Pass 1: geometry only — no image data copies.
+    let placements = runtime.kitty_image_placements_with_data_filter(|_| false);
+    if placements.is_empty() {
+        return SixelTranscodeOutcome {
+            splices: Vec::new(),
+            state: PaneTranscodeState::default(),
+        };
+    }
+
+    struct Resolved {
+        key: (u32, u32),
+        tracked: TranscodedPlacement,
+        encode_key: crate::sixel_encode::SixelEncodeKey,
+        source: (u32, u32, u32, u32),
+        target: (u32, u32),
+        row: u16,
+        col: u16,
+        data_fingerprint: u64,
+        changed: bool,
+        png_passthrough: bool,
+    }
+
+    let mut resolved = Vec::with_capacity(placements.len());
+    for placement in &placements {
+        let host_placement = HostPlacement {
+            raw_data: None,
+            pane_id,
+            host_image_id: None,
+            area: pane_rect,
+            cell_size,
+            source_key: HostSourceKey::Terminal {
+                pane_id,
+                image_id: placement.image_id,
+            },
+            placement: placement.clone(),
+            scrollback_offset,
+        };
+        let Some((clipped, format_code)) = clipped_placement(&host_placement) else {
+            continue;
+        };
+        let image = image_signature(&host_placement, format_code);
+        let placement_sig = placement_signature(clipped, placement.z, scrollback_offset);
+        let key = (placement.image_id, placement.placement_id);
+        let tracked = TranscodedPlacement {
+            image,
+            placement: placement_sig,
+        };
+        let changed = previous.and_then(|state| state.0.get(&key)).copied() != Some(tracked);
+        let source = (
+            clipped.source_x,
+            clipped.source_y,
+            clipped.source_width,
+            clipped.source_height,
+        );
+        // IIP sizes in cells: the outer terminal scales into the cell
+        // rect itself, so the target is the clipped cell span.
+        let target = (clipped.cols, clipped.rows);
+        let png_passthrough = placement.format == KittyImageFormat::Png
+            && source == (0, 0, placement.image_width, placement.image_height)
+            && (placement.image_width as u64) * (placement.image_height as u64)
+                <= IIP_PNG_PASSTHROUGH_MAX_PIXELS;
+        resolved.push(Resolved {
+            key,
+            tracked,
+            encode_key: crate::sixel_encode::SixelEncodeKey {
+                data_fingerprint: placement.data_fingerprint,
+                data_len: placement.data_len,
+                source,
+                target,
+            },
+            source,
+            target,
+            row: clipped.y - pane_rect.y,
+            col: clipped.x - pane_rect.x,
+            data_fingerprint: placement.data_fingerprint,
+            changed,
+            png_passthrough,
+        });
+    }
+
+    // Pass 2: fetch image bytes only for changed placements whose encode is
+    // not already cached.
+    let needed: HashSet<u64> = resolved
+        .iter()
+        .filter(|entry| entry.changed && !encode_cache.contains(&entry.encode_key))
+        .map(|entry| entry.data_fingerprint)
+        .collect();
+    let mut fetched: HashMap<u64, KittyImagePlacement> = HashMap::new();
+    if !needed.is_empty() {
+        for placement in runtime
+            .kitty_image_placements_with_data_filter(|d| needed.contains(&d.data_fingerprint))
+        {
+            if placement.data.is_empty() {
+                continue;
+            }
+            fetched
+                .entry(placement.data_fingerprint)
+                .or_insert(placement);
+        }
+    }
+
+    let mut splices = Vec::new();
+    let mut state = PaneTranscodeState::default();
+    for entry in resolved {
+        if !entry.changed {
+            state.0.insert(entry.key, entry.tracked);
+            continue;
+        }
+        let encoded = match encode_cache.get(&entry.encode_key) {
+            Some(encoded) => Some(encoded),
+            None => match fetched.get(&entry.data_fingerprint) {
+                Some(placement) => {
+                    let encoded = if entry.png_passthrough {
+                        crate::iip_encode::encode_iip(
+                            crate::iip_encode::IipSource::Png(&placement.data),
+                            entry.target.0,
+                            entry.target.1,
+                        )
+                        .unwrap_or_default()
+                    } else {
+                        let (sx, sy, sw, sh) = entry.source;
+                        prepare_image(placement)
+                            .and_then(|image| {
+                                crate::sixel_encode::crop_rgba(
+                                    &image.rgba,
+                                    image.width,
+                                    image.height,
+                                    sx,
+                                    sy,
+                                    sw,
+                                    sh,
+                                )
+                            })
+                            .and_then(|(cropped, cw, ch)| {
+                                crate::iip_encode::encode_iip(
+                                    crate::iip_encode::IipSource::Rgba {
+                                        data: &cropped,
+                                        width: cw,
+                                        height: ch,
+                                    },
+                                    entry.target.0,
+                                    entry.target.1,
+                                )
+                            })
+                            .unwrap_or_default()
+                    };
+                    // Decode/encode failure yields an empty payload; caching
+                    // it makes the permanent-drop commit below cheap on
+                    // every future signature change of the same bytes.
+                    encode_cache.insert(entry.encode_key, encoded.clone());
+                    Some(encoded)
+                }
+                // Data unavailable this pass (image raced away): leave the
+                // old signature in place so the placement retries.
+                None => {
+                    if let Some(old) = previous.and_then(|state| state.0.get(&entry.key)) {
+                        state.0.insert(entry.key, *old);
+                    }
+                    continue;
+                }
+            },
+        };
+        let Some(encoded) = encoded else { continue };
+        if encoded.is_empty() {
+            state.0.insert(entry.key, entry.tracked);
+            continue;
+        }
+        let cost = encoded.len() + SIXEL_TRANSCODE_SPLICE_SLACK;
+        if cost > budget_bytes {
+            tracing::warn!(
+                pane = pane_id.raw(),
+                bytes = encoded.len(),
+                budget = budget_bytes,
+                "dropping oversized iip transcode emission"
+            );
+            state.0.insert(entry.key, entry.tracked);
+            continue;
+        }
+        if *used_bytes + cost > budget_bytes {
+            // Over budget this frame: keep the previous signature (or
+            // none) so the placement re-diffs as changed next frame.
+            if let Some(old) = previous.and_then(|state| state.0.get(&entry.key)) {
+                state.0.insert(entry.key, *old);
+            }
+            continue;
+        }
+        *used_bytes += cost;
+        splices.push(crate::protocol::SixelSplice {
+            pane_id: pane_id.raw(),
+            rect: crate::protocol::SixelPaneRect {
+                x: pane_rect.x,
+                y: pane_rect.y,
+                width: pane_rect.width,
+                height: pane_rect.height,
+            },
+            row: entry.row,
+            col: entry.col,
+            data: encoded,
+        });
+        state.0.insert(entry.key, entry.tracked);
+    }
+
+    SixelTranscodeOutcome { splices, state }
+}
 pub(crate) fn image_transfer_estimated_size(data_len: usize) -> usize {
     let encoded = data_len.div_ceil(3).saturating_mul(4);
     let command_overhead = data_len.div_ceil(KITTY_CHUNK_BYTES).saturating_mul(16) + 1024;
@@ -841,6 +1482,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn placeholder_hiding_override_scopes_and_restores() {
+        {
+            let _hide = hide_placeholders_for_render(true);
+            assert!(placeholders_hidden());
+            {
+                let _show = hide_placeholders_for_render(false);
+                assert!(!placeholders_hidden());
+            }
+            assert!(placeholders_hidden(), "outer override restored");
+        }
+        // With no override the value falls back to the process-global
+        // flag. Parallel tests may construct apps that write the global
+        // concurrently, so only assert when it was stable across the read.
+        let before = is_enabled();
+        let hidden = placeholders_hidden();
+        if before == is_enabled() {
+            assert_eq!(hidden, before);
+        }
+    }
+
+    #[test]
+    fn blank_placeholder_cells_scrubs_placeholder_glyphs_in_place() {
+        let placeholder = |symbol: &str| crate::protocol::CellData {
+            symbol: symbol.to_string(),
+            fg: 0x02_12_34_56, // image-id color, not a real foreground
+            bg: 0x02_10_20_30,
+            modifier: ratatui::style::Modifier::UNDERLINED.bits(),
+            skip: false,
+            hyperlink: Some(0),
+        };
+        let mut frame = crate::protocol::FrameData {
+            cells: vec![
+                placeholder("\u{10eeee}\u{0305}\u{0305}"),
+                placeholder("\u{10eeee}\u{0305}\u{030d}"),
+                crate::protocol::CellData {
+                    symbol: "x".to_string(),
+                    fg: 7,
+                    bg: 3,
+                    modifier: 1,
+                    skip: false,
+                    hyperlink: None,
+                },
+                placeholder("\u{10eeee}"),
+            ],
+            width: 4,
+            height: 1,
+            cursor: None,
+            hyperlinks: vec!["https://example.com".to_string()],
+            graphics: Vec::new(),
+        };
+
+        blank_placeholder_cells(&mut frame);
+
+        for cell in [&frame.cells[0], &frame.cells[1], &frame.cells[3]] {
+            assert_eq!(cell.symbol, " ", "placeholder becomes a blank space");
+            assert_eq!(cell.fg, 0, "image-id foreground reset");
+            assert_eq!(cell.bg, 0x02_10_20_30, "background preserved");
+            assert_eq!(cell.modifier, 0, "modifiers reset");
+            assert_eq!(cell.hyperlink, None, "hyperlink cleared");
+        }
+        let untouched = &frame.cells[2];
+        assert_eq!(
+            (
+                untouched.symbol.as_str(),
+                untouched.fg,
+                untouched.bg,
+                untouched.modifier
+            ),
+            ("x", 7, 3, 1),
+            "non-placeholder cells stay untouched"
+        );
+    }
     fn test_placement(viewport_col: i32, viewport_row: i32) -> HostPlacement {
         HostPlacement {
             raw_data: None,

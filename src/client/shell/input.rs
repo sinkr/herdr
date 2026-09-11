@@ -238,6 +238,18 @@ impl ClientShellState {
                         }
                     }
                 }
+                RawInputEvent::Osc5522(data) => {
+                    if let Some(pane_id) = self.focused_pane_id() {
+                        let reply =
+                            crate::protocol::endpoint::EndpointPaneOsc5522 { pane_id, data };
+                        if let Ok(data) = serde_json::to_string(&reply) {
+                            outcome.requests.push(ClientMessage::EndpointControl {
+                                kind: crate::protocol::endpoint::PANE_OSC5522_KIND.into(),
+                                data,
+                            });
+                        }
+                    }
+                }
                 RawInputEvent::Mouse(mouse) => self.handle_mouse(mouse, &mut outcome),
                 RawInputEvent::OuterFocusGained => {
                     self.outer_focused = Some(true);

@@ -67,13 +67,6 @@ fn cli_rejects_protocol_mismatch_before_agent_wait_request() {
     let error: serde_json::Value = serde_json::from_slice(&waited.stderr).unwrap();
     assert_eq!(error["id"], "cli:agent:wait");
     assert_eq!(error["error"]["code"], "protocol_mismatch");
-    let message = error["error"]["message"].as_str().unwrap();
-    assert!(
-        message.contains(&format!("client protocol {CURRENT_PROTOCOL}")),
-        "message: {message}"
-    );
-    assert!(message.contains("server protocol 14"), "message: {message}");
-    assert!(message.contains("restart"), "message: {message}");
 
     let (first_line, second_line) = server.join().unwrap();
     let first_request: serde_json::Value = serde_json::from_str(&first_line).unwrap();

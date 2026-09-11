@@ -39,6 +39,63 @@ pub struct EndpointAgentCompletions {
     pub completions: std::collections::BTreeMap<String, u64>,
 }
 
+pub const PASSTHROUGH_CAPABILITY: &str = "passthrough_v1";
+pub const PASSTHROUGH_KIND: &str = "endpoint.passthrough.v1";
+pub const PANE_OSC5522_KIND: &str = "endpoint.pane.osc5522.v1";
+pub const VIEWER_KIND: &str = "endpoint.viewer.v1";
+
+/// JSON controls use base64 rather than decimal arrays to keep maximum-size
+/// enhanced-paste sequences within the graphics frame limit.
+pub(super) mod json_bytes {
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+        } else {
+            bytes.serialize(serializer)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        if deserializer.is_human_readable() {
+            let encoded = String::deserialize(deserializer)?;
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(serde::de::Error::custom)
+        } else {
+            Vec::<u8>::deserialize(deserializer)
+        }
+    }
+}
+
+/// One-shot emissions paired with an accepted pane surface, never a frame baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointPassthrough {
+    pub boot_id: String,
+    pub projection_revision: u64,
+    pub surface_revision: u64,
+    pub sixels: Vec<super::SixelSplice>,
+    pub raw_osc: Vec<super::RawOsc>,
+    pub iip: Vec<super::SixelSplice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointPaneOsc5522 {
+    pub pane_id: String,
+    /// Complete OSC 5522 bytes, including introducer and terminator.
+    #[serde(with = "json_bytes")]
+    pub data: Vec<u8>,
+}
+
+pub fn passthrough_message(value: &EndpointPassthrough) -> serde_json::Result<ServerMessage> {
+    Ok(ServerMessage::EndpointControl {
+        kind: PASSTHROUGH_KIND.into(),
+        data: serde_json::to_string(value)?,
+    })
+}
+
 fn default_true() -> bool {
     true
 }
@@ -61,6 +118,14 @@ pub struct EndpointClientHello {
     /// Accept the optional surface-delta encoding on this connection.
     #[serde(default)]
     pub surface_delta: bool,
+    #[serde(default)]
+    pub sixel_graphics: bool,
+    #[serde(default)]
+    pub iip_graphics: bool,
+    #[serde(default)]
+    pub geometry_passive: bool,
+    #[serde(default)]
+    pub passthrough: bool,
     #[serde(default)]
     pub snapshot_codecs: Vec<String>,
     #[serde(default)]
@@ -170,6 +235,7 @@ impl EndpointServerWelcome {
                 HEALTH_CHECK_CAPABILITY.into(),
                 AGENT_VIEW_PROJECTION_CAPABILITY.into(),
                 AGENT_COMPLETIONS_CAPABILITY.into(),
+                PASSTHROUGH_CAPABILITY.into(),
             ],
             error: None,
         }
@@ -210,6 +276,10 @@ mod tests {
             surface_active: true,
             surface_reuse: false,
             surface_delta: false,
+            sixel_graphics: false,
+            iip_graphics: false,
+            geometry_passive: false,
+            passthrough: false,
             snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
@@ -377,6 +447,7 @@ mod tests {
                 HEALTH_CHECK_CAPABILITY.to_string(),
                 AGENT_VIEW_PROJECTION_CAPABILITY.to_string(),
                 AGENT_COMPLETIONS_CAPABILITY.to_string(),
+                PASSTHROUGH_CAPABILITY.to_string(),
             ]
         );
     }
@@ -408,5 +479,35 @@ mod tests {
         value["future_service"] = serde_json::json!("v2");
         let decoded: EndpointServerWelcome = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, welcome);
+    }
+
+    #[test]
+    fn maximum_enhanced_paste_crosses_bounded_endpoint_wire() {
+        let mut bytes = b"\x1b]5522;type=write:mime=x;".to_vec();
+        bytes.resize(crate::raw_input::OSC5522_MAX_SEQUENCE_BYTES - 1, b'A');
+        bytes.push(7);
+        let value = EndpointPaneOsc5522 {
+            pane_id: "pane-1".into(),
+            data: bytes,
+        };
+        let message = super::super::ClientMessage::EndpointControl {
+            kind: PANE_OSC5522_KIND.into(),
+            data: serde_json::to_string(&value).unwrap(),
+        };
+        let mut wire = Vec::new();
+        super::super::write_message(&mut wire, &message).unwrap();
+        let received: super::super::ClientMessage =
+            super::super::read_message(&mut wire.as_slice(), super::super::MAX_GRAPHICS_FRAME_SIZE)
+                .expect("maximum valid enhanced paste must pass the real ingress frame limit");
+        let super::super::ClientMessage::EndpointControl { data, .. } = received else {
+            panic!("expected enhanced paste control");
+        };
+        let decoded: EndpointPaneOsc5522 = serde_json::from_str(&data).unwrap();
+        let mut framer = crate::raw_input::RawInputFramer::default();
+        let events = framer.push(&decoded.data);
+        let [crate::raw_input::RawInputEvent::Osc5522(data)] = events.as_slice() else {
+            panic!("wire payload must still be a complete valid terminal OSC 5522 event");
+        };
+        assert_eq!(data, &value.data);
     }
 }

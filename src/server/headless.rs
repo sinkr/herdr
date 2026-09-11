@@ -177,6 +177,18 @@ enum AltScreenReadConflict {
     Defer,
 }
 
+/// Watermark movements produced by gathering one pane's pending passthrough
+/// emissions (Sixel or raw OSC) for one client. See
+/// [`HeadlessServer::collect_client_pane_sixels`] and
+/// [`HeadlessServer::collect_client_pane_raw_osc`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PassthroughCollectOutcome {
+    /// First-sight baseline to record on the client immediately.
+    init: Option<u64>,
+    /// Delivery watermark to commit once the carrying frame is sent.
+    delivered: Option<u64>,
+}
+
 /// The headless server — runs the herdr event loop without a real terminal.
 pub struct HeadlessServer {
     app: app::App,
@@ -217,6 +229,14 @@ pub struct HeadlessServer {
     server_config_diagnostic_without_keybindings: Option<String>,
     /// Writable direct attach owner per terminal id string.
     terminal_attach_owners: HashMap<String, u64>,
+    /// Shared cache of encoded Sixel emissions for Kitty→Sixel transcode,
+    /// reused across all Sixel-declaring clients.
+    sixel_encode_cache: crate::sixel_encode::SixelEncodeCache,
+    /// Shared cache of encoded IIP emissions for Kitty→IIP transcode,
+    /// reused across all IIP-declaring clients. Separate from
+    /// `sixel_encode_cache`: the same key encodes to different bytes per
+    /// output format.
+    iip_encode_cache: crate::sixel_encode::SixelEncodeCache,
     /// Deferred application-history reads currently driving alternate-screen viewports.
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
     /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
@@ -356,6 +376,8 @@ impl HeadlessServer {
             server_config_diagnostic,
             server_config_diagnostic_without_keybindings,
             terminal_attach_owners: HashMap::new(),
+            sixel_encode_cache: crate::sixel_encode::SixelEncodeCache::default(),
+            iip_encode_cache: crate::sixel_encode::SixelEncodeCache::default(),
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
@@ -856,6 +878,13 @@ impl HeadlessServer {
         }
         client.last_activity = stamp;
 
+        // Geometry-passive viewers never become the foreground client: their
+        // terminal geometry must not drive pane sizing, so their input and
+        // resizes leave the current foreground (and effective size) alone.
+        if client.geometry_passive {
+            return false;
+        }
+
         let changed = self.foreground_client_id != Some(client_id);
         self.foreground_client_id = Some(client_id);
         self.sync_foreground_client_state();
@@ -917,12 +946,14 @@ impl HeadlessServer {
             self.release_client_shell_inputs(client_id, held_inputs);
             crate::server::clipboard_image::remove_files(removed.staged_clipboard_files);
             if let ClientConnectionMode::TerminalAttach { terminal_id } = removed.mode {
-                self.terminal_attach_owners.remove(&terminal_id);
-                if let Some(terminal_id) = self.terminal_id_by_string(&terminal_id) {
-                    self.app
-                        .state
-                        .direct_attach_resize_locks
-                        .remove(&terminal_id);
+                if self.terminal_attach_owners.get(&terminal_id) == Some(&client_id) {
+                    self.terminal_attach_owners.remove(&terminal_id);
+                    if let Some(terminal_id) = self.terminal_id_by_string(&terminal_id) {
+                        self.app
+                            .state
+                            .direct_attach_resize_locks
+                            .remove(&terminal_id);
+                    }
                 }
             }
         }
@@ -1728,6 +1759,13 @@ impl HeadlessServer {
             return false;
         }
 
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            if client.geometry_passive {
+                client.mode = ClientConnectionMode::TerminalAttach { terminal_id };
+                client.render_state.reset_baseline();
+                return true;
+            }
+        }
         if let Some(existing_owner) = self.terminal_attach_owners.get(&terminal_id).copied() {
             if existing_owner != client_id && !takeover {
                 self.send_to_client(
@@ -1796,6 +1834,17 @@ impl HeadlessServer {
         }
 
         match ev {
+            ServerEvent::ClientViewer {
+                client_id,
+                geometry_passive,
+            } => {
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    if matches!(client.mode, ClientConnectionMode::TerminalPending) {
+                        client.geometry_passive = geometry_passive;
+                    }
+                }
+                false
+            }
             ServerEvent::ClientConnected {
                 client_id,
                 cols,
@@ -1853,6 +1902,10 @@ impl HeadlessServer {
                 surface_active,
                 surface_reuse,
                 surface_delta,
+                sixel_graphics,
+                iip_graphics,
+                geometry_passive,
+                passthrough,
                 writer,
             } => {
                 if self.handoff_in_progress {
@@ -1895,6 +1948,10 @@ impl HeadlessServer {
                 );
                 connection.pixel_mouse = pixel_mouse && observed.is_known();
                 connection.direct_graphics = direct_graphics;
+                connection.sixel_graphics = passthrough && sixel_graphics;
+                connection.iip_graphics = passthrough && iip_graphics;
+                connection.geometry_passive = geometry_passive;
+                connection.passthrough = passthrough;
                 connection.shell_uses_endpoint_keybindings = endpoint_keybindings;
                 connection.shell_mouse_capture = mouse_capture;
                 connection.shell_surface_active = surface_active;
@@ -1960,7 +2017,7 @@ impl HeadlessServer {
                 }
                 self.send_to_client(client_id, completion_message);
                 self.send_to_client(client_id, snapshot_message);
-                if surface_active {
+                if surface_active && !geometry_passive {
                     self.foreground_client_id = Some(client_id);
                 }
                 if first_app_client {
@@ -2130,6 +2187,7 @@ impl HeadlessServer {
                     cell_size,
                     pixel_mouse: client_pixel_mouse,
                     render_state,
+                    geometry_passive,
                     ..
                 }) = self.clients.get_mut(&client_id)
                 {
@@ -2137,13 +2195,15 @@ impl HeadlessServer {
                     *cell_size = observed;
                     *client_pixel_mouse = pixel_mouse;
                     render_state.request_repaint();
-                    Some((terminal_id.clone(), *cell_size))
+                    Some((terminal_id.clone(), *cell_size, *geometry_passive))
                 } else {
                     None
                 };
-                if let Some((terminal_id, cell_size)) = direct_terminal_id {
-                    if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
-                        runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
+                if let Some((terminal_id, cell_size, geometry_passive)) = direct_terminal_id {
+                    if !geometry_passive {
+                        if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
+                            runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
+                        }
                     }
                     return true;
                 }
@@ -2296,6 +2356,41 @@ impl HeadlessServer {
                         data: token,
                     },
                 )
+            }
+            ServerEvent::ClientShellOsc5522 {
+                client_id,
+                pane_id,
+                data,
+            } => {
+                if self.handoff_in_progress
+                    || !self
+                        .clients
+                        .get(&client_id)
+                        .is_some_and(|client| client.is_active_shell_client() && client.passthrough)
+                {
+                    return false;
+                }
+                let Some((workspace_index, runtime_pane_id)) = self.app.parse_pane_id(&pane_id)
+                else {
+                    return false;
+                };
+                if !self.shell_client_views_pane(client_id, workspace_index, runtime_pane_id)
+                    || (self.app.state.popup_pane.is_some()
+                        && self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id))
+                {
+                    return false;
+                }
+                let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
+                    &self.app.terminal_runtimes,
+                    workspace_index,
+                    runtime_pane_id,
+                ) else {
+                    return false;
+                };
+                if let Err(err) = runtime.try_send_bytes(bytes::Bytes::from(data)) {
+                    warn!(client_id, pane_id, err = %err, "targeted enhanced paste failed");
+                }
+                false
             }
             ServerEvent::ClientShellPaneInput {
                 client_id,
@@ -3176,6 +3271,145 @@ impl HeadlessServer {
         changed
     }
 
+    /// Per-frame byte budget for Sixel payloads riding one frame — shared
+    /// by passthrough emissions and Kitty→Sixel transcode splices. Large
+    /// enough that any single passthrough emission (capped at 8 MiB by the
+    /// terminal) always fits, so delivery is guaranteed to progress.
+    const SIXEL_FRAME_BUDGET: usize = 9 * 1024 * 1024;
+
+    /// Budget slack per splice record, matching the pane-side estimate.
+    const SIXEL_SPLICE_SLACK: usize = 32;
+
+    /// Gathers one pane's pending Sixel emissions for one client.
+    ///
+    /// TerminalAnsi clients receive pre-encoded DECSC + CUP + DECRC byte
+    /// splices in `sixel_bytes`; SemanticFrame clients receive positioned
+    /// [`protocol::SixelSplice`] records in `sixel_splices`, resolved
+    /// against `pane_rect` (the pane's content rect in the frame being
+    /// rendered). The 9 MiB per-frame budget is shared across both shapes
+    /// and all panes of the frame.
+    ///
+    /// `watermark` is the client's recorded per-pane delivery watermark;
+    /// `None` means this client sees the pane for the first time. The
+    /// returned [`PassthroughCollectOutcome::init`] baseline snapshot MUST
+    /// be recorded on the client immediately — first sight is a fact about
+    /// this frame pass, not about frame delivery — while
+    /// [`PassthroughCollectOutcome::delivered`] commits only after the frame
+    /// carrying the payload was actually sent.
+    fn collect_client_pane_sixels(
+        watermark: Option<u64>,
+        terminal_ansi: bool,
+        runtime: &crate::terminal::TerminalRuntime,
+        pane_id: crate::layout::PaneId,
+        pane_rect: Rect,
+        sixel_bytes: &mut Vec<u8>,
+        sixel_splices: &mut Vec<protocol::SixelSplice>,
+    ) -> PassthroughCollectOutcome {
+        let (watermark, init) = match watermark {
+            Some(watermark) => (watermark, None),
+            None => {
+                let latest = runtime.latest_sixel_seq();
+                (latest, Some(latest))
+            }
+        };
+        let advanced = if terminal_ansi {
+            runtime.encode_pending_sixels_after(
+                watermark,
+                (pane_rect.x, pane_rect.y),
+                Self::SIXEL_FRAME_BUDGET,
+                sixel_bytes,
+            )
+        } else {
+            let used = sixel_splices
+                .iter()
+                .map(|splice| splice.data.len() + Self::SIXEL_SPLICE_SLACK)
+                .sum();
+            let mut pending = Vec::new();
+            let advanced = runtime.collect_pending_sixels_after(
+                watermark,
+                used,
+                Self::SIXEL_FRAME_BUDGET,
+                &mut pending,
+            );
+            sixel_splices.extend(pending.into_iter().map(|pending| protocol::SixelSplice {
+                pane_id: pane_id.raw(),
+                rect: protocol::SixelPaneRect {
+                    x: pane_rect.x,
+                    y: pane_rect.y,
+                    width: pane_rect.width,
+                    height: pane_rect.height,
+                },
+                row: pending.row,
+                col: pending.col,
+                data: pending.data,
+            }));
+            advanced
+        };
+        PassthroughCollectOutcome {
+            init,
+            delivered: (advanced > watermark).then_some(advanced),
+        }
+    }
+
+    /// Gathers one pane's pending raw OSC 5522 emissions for one client.
+    ///
+    /// TerminalAnsi clients receive the sequences verbatim in `osc_bytes`
+    /// (no positioning wrap; the payload is location-independent);
+    /// SemanticFrame clients receive [`protocol::RawOsc`] records in
+    /// `osc_records`. The 4 MiB per-frame budget is shared across both
+    /// shapes and all panes of the frame; an emission that alone exceeds
+    /// the budget is dropped by the pane-side fold so delivery always
+    /// progresses.
+    ///
+    /// Watermark discipline is identical to
+    /// [`Self::collect_client_pane_sixels`].
+    fn collect_client_pane_raw_osc(
+        watermark: Option<u64>,
+        terminal_ansi: bool,
+        runtime: &crate::terminal::TerminalRuntime,
+        pane_id: crate::layout::PaneId,
+        osc_bytes: &mut Vec<u8>,
+        osc_records: &mut Vec<protocol::RawOsc>,
+    ) -> PassthroughCollectOutcome {
+        /// Per-frame byte budget for raw OSC passthrough payloads. The
+        /// pane-emitted 5522 packets (read requests, statuses) are small;
+        /// oversized outliers are dropped rather than wedging delivery.
+        const RAW_OSC_FRAME_BUDGET: usize = 4 * 1024 * 1024;
+        /// Budget slack per record, matching the pane-side estimate.
+        const RAW_OSC_RECORD_SLACK: usize = 32;
+
+        let (watermark, init) = match watermark {
+            Some(watermark) => (watermark, None),
+            None => {
+                let latest = runtime.latest_osc5522_seq();
+                (latest, Some(latest))
+            }
+        };
+        let advanced = if terminal_ansi {
+            runtime.encode_pending_osc5522_after(watermark, RAW_OSC_FRAME_BUDGET, osc_bytes)
+        } else {
+            let used = osc_records
+                .iter()
+                .map(|record| record.data.len() + RAW_OSC_RECORD_SLACK)
+                .sum();
+            let mut pending = Vec::new();
+            let advanced = runtime.collect_pending_osc5522_after(
+                watermark,
+                used,
+                RAW_OSC_FRAME_BUDGET,
+                &mut pending,
+            );
+            osc_records.extend(pending.into_iter().map(|pending| protocol::RawOsc {
+                pane_id: pane_id.raw(),
+                data: pending.data,
+            }));
+            advanced
+        };
+        PassthroughCollectOutcome {
+            init,
+            delivered: (advanced > watermark).then_some(advanced),
+        }
+    }
     /// Handle scheduled tasks for the headless server.
     ///
     /// Similar to the former App scheduler but without terminal resize polling.
@@ -3318,6 +3552,12 @@ fn ctrlc_handler(should_quit: Arc<AtomicBool>, server_event_tx: mpsc::Sender<Ser
         // Wake up the event loop so the quit flag is checked promptly.
         let _ = server_event_tx.try_send(ServerEvent::QuitSignal);
     });
+    // ctrlc's "termination" feature registers SIGINT, SIGTERM, and SIGHUP
+    // together. A detached daemon must not treat SIGHUP as quit — that is
+    // how a dying terminal (or whatever cleans up after it) used to take the
+    // whole server and every pane down with it — so re-shield SIGHUP after
+    // ctrlc re-registered it. Foreground `herdr server` runs keep all three.
+    crate::platform::shield_detached_server_daemon_from_sighup();
 }
 
 /// Sleep until a deadline, or return pending if none.
@@ -3370,6 +3610,7 @@ fn server_config_diagnostic_summaries(diagnostics: &[String]) -> (Option<String>
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+
 // Tests
 // ---------------------------------------------------------------------------
 

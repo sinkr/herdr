@@ -200,6 +200,10 @@ pub(super) fn do_handshake(
             surface_active,
             surface_reuse: true,
             surface_delta: true,
+            sixel_graphics: HOST_GRAPHICS.get().is_some_and(|graphics| graphics.0),
+            iip_graphics: HOST_GRAPHICS.get().is_some_and(|graphics| graphics.1),
+            geometry_passive: geometry_passive_capability(),
+            passthrough: true,
             snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
@@ -278,6 +282,20 @@ pub(super) fn do_handshake(
                 error: "server has no compatible endpoint core; update this machine".into(),
             });
         }
+        if (geometry_passive_capability()
+            || HOST_GRAPHICS
+                .get()
+                .is_some_and(|graphics| graphics.0 || graphics.1))
+            && !welcome
+                .capabilities
+                .iter()
+                .any(|capability| capability == crate::protocol::endpoint::PASSTHROUGH_CAPABILITY)
+        {
+            return Err(ClientError::HandshakeRejected {
+                version: welcome.generation,
+                error: "server does not support requested viewer/graphics capabilities; update this machine".into(),
+            });
+        }
         info!(
             generation = welcome.generation,
             server_version = %welcome.server_version,
@@ -299,6 +317,12 @@ pub(super) fn do_handshake(
             if let Some(error) = error {
                 return Err(ClientError::HandshakeRejected { version, error });
             }
+            if geometry_passive_capability() && version != PROTOCOL_VERSION {
+                return Err(ClientError::HandshakeRejected {
+                    version,
+                    error: "server does not support geometry-passive terminal attach; update this machine".into(),
+                });
+            }
             info!(version, ?encoding, "handshake succeeded");
             Ok(HandshakeResult {
                 encoding,
@@ -312,6 +336,175 @@ pub(super) fn do_handshake(
     }
 }
 
+static HOST_GRAPHICS: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+
+pub(super) fn initialize_host_graphics(kitty_graphics_enabled: bool) {
+    HOST_GRAPHICS.get_or_init(|| {
+        (
+            sixel_graphics_capability(kitty_graphics_enabled),
+            iip_graphics_capability(),
+        )
+    });
+}
+
+/// Primary Device Attributes request for the outer terminal.
+const HOST_DA1_QUERY: &[u8] = b"\x1b[c";
+
+/// How long the pre-handshake DA1 probe waits for the outer terminal's
+/// reply before assuming no Sixel support.
+#[cfg(unix)]
+const DA1_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Environment override for the Sixel capability declared in Hello:
+/// `1` forces it on, `0` forces it off, anything else defers to the probe.
+pub(super) const FORCE_SIXEL_ENV_VAR: &str = "HERDR_FORCE_SIXEL";
+
+/// Resolves the `sixel_graphics` value for this client's Hello.
+///
+/// `HERDR_FORCE_SIXEL=1`/`0` wins outright. Otherwise the outer terminal
+/// is probed with DA1 only when client-side Kitty graphics are disabled
+/// (a Kitty-capable outer terminal takes the native replay path instead).
+pub(super) fn sixel_graphics_capability(kitty_graphics_enabled: bool) -> bool {
+    match std::env::var(FORCE_SIXEL_ENV_VAR).ok().as_deref() {
+        Some("1") => return true,
+        Some("0") => return false,
+        _ => {}
+    }
+    if kitty_graphics_enabled {
+        return false;
+    }
+    probe_outer_terminal_sixel()
+}
+
+/// Environment override for the IIP capability declared in Hello:
+/// `1` forces it on, `0` forces it off. There is no probe — IIP support
+/// is not discoverable via DA1, so the capability defaults to off.
+pub(super) const FORCE_IIP_ENV_VAR: &str = "HERDR_FORCE_IIP";
+
+/// Resolves the `iip_graphics` value for this client's Hello.
+///
+/// `HERDR_FORCE_IIP=1`/`0` wins outright; without the override the
+/// capability is off (env-only, no probe).
+pub(super) fn iip_graphics_capability() -> bool {
+    matches!(std::env::var(FORCE_IIP_ENV_VAR).ok().as_deref(), Some("1"))
+}
+
+/// Environment opt-in for the geometry-passive viewer mode declared in
+/// Hello: `1` marks this client as a passive viewer that never becomes the
+/// foreground client and never drives pane sizing. Env-only, no probe.
+pub(super) const VIEWER_ENV_VAR: &str = "HERDR_VIEWER";
+
+/// Resolves the `geometry_passive` value for this client's Hello.
+///
+/// `HERDR_VIEWER=1` opts in; anything else (including unset) is a normal
+/// foreground-eligible client.
+pub(super) fn geometry_passive_capability() -> bool {
+    matches!(std::env::var(VIEWER_ENV_VAR).ok().as_deref(), Some("1"))
+}
+
+/// Parses an accumulated DA1 reply (`ESC [ ? Ps ; ... c`).
+///
+/// Returns `Some(true)` when the attribute list contains `4` (Sixel),
+/// `Some(false)` for a complete reply without it, and `None` while no
+/// complete reply has arrived yet.
+pub(super) fn parse_da1_sixel_reply(buffer: &[u8]) -> Option<bool> {
+    let mut index = 0;
+    while let Some(start) = buffer[index..]
+        .windows(3)
+        .position(|window| window == b"\x1b[?")
+    {
+        let params_start = index + start + 3;
+        let mut end = params_start;
+        while end < buffer.len() && matches!(buffer[end], b'0'..=b'9' | b';') {
+            end += 1;
+        }
+        if end >= buffer.len() {
+            return None;
+        }
+        if buffer[end] == b'c' {
+            let mut fields = buffer[params_start..end].split(|byte| *byte == b';');
+            // The first parameter is the device class; Sixel is attribute 4
+            // in the remainder.
+            let _class = fields.next();
+            return Some(fields.any(|field| field == b"4"));
+        }
+        index = end.max(params_start);
+    }
+    None
+}
+
+/// Probes the outer terminal's DA1 attributes for Sixel support.
+///
+/// Runs before the handshake (and before the client's terminal setup), so
+/// it briefly enables raw mode itself and restores it. Any timeout, probe
+/// failure, or non-TTY stdio reports no Sixel support. A reply arriving
+/// after the timeout is consumed and dropped later by the raw input
+/// framer's unsupported-sequence handling.
+#[cfg(unix)]
+fn probe_outer_terminal_sixel() -> bool {
+    use std::io::IsTerminal;
+    let stdin = io::stdin();
+    if !stdin.is_terminal() || !io::stdout().is_terminal() {
+        return false;
+    }
+    if crossterm::terminal::enable_raw_mode().is_err() {
+        return false;
+    }
+    let sixel = run_da1_probe(&stdin);
+    let _ = crossterm::terminal::disable_raw_mode();
+    tracing::debug!(sixel, "probed outer terminal DA1 for sixel support");
+    sixel
+}
+
+#[cfg(windows)]
+fn probe_outer_terminal_sixel() -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn run_da1_probe(stdin: &io::Stdin) -> bool {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+
+    let mut stdout = io::stdout();
+    if stdout
+        .write_all(HOST_DA1_QUERY)
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        return false;
+    }
+
+    let deadline = std::time::Instant::now() + DA1_PROBE_TIMEOUT;
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match crate::client::input::poll_read_ready(
+            stdin.as_raw_fd(),
+            remaining.as_millis().min(i32::MAX as u128) as i32,
+        ) {
+            Some(true) => {}
+            _ => return false,
+        }
+        let Ok(read) = stdin.lock().read(&mut chunk) else {
+            return false;
+        };
+        if read == 0 {
+            return false;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(sixel) = parse_da1_sixel_reply(&buffer) {
+            return sixel;
+        }
+        if buffer.len() > 4096 {
+            return false;
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

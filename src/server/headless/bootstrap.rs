@@ -14,6 +14,7 @@ pub fn run_server() -> io::Result<()> {
         }
     }
     crate::platform::raise_server_nofile_limit();
+    crate::platform::shield_detached_server_daemon_from_sighup();
 
     if handoff_import {
         let socket_path = args

@@ -913,3 +913,139 @@ fn forward_clipboard_uses_local_clipboard_path() {
     assert!(forward_clipboard("dGVzdA=="));
     assert!(!forward_clipboard("not base64"));
 }
+
+#[test]
+fn da1_reply_parsing_detects_sixel_attribute() {
+    // Incomplete replies keep waiting.
+    assert_eq!(parse_da1_sixel_reply(b""), None);
+    assert_eq!(parse_da1_sixel_reply(b"\x1b[?63;1;2;"), None);
+    // Sixel is attribute 4 after the device-class parameter.
+    assert_eq!(parse_da1_sixel_reply(b"\x1b[?63;1;2;4;6c"), Some(true));
+    assert_eq!(parse_da1_sixel_reply(b"\x1b[?64;4c"), Some(true));
+    assert_eq!(parse_da1_sixel_reply(b"\x1b[?6c"), Some(false));
+    // The class parameter alone is not a Sixel attribute...
+    assert_eq!(parse_da1_sixel_reply(b"\x1b[?4c"), Some(false));
+    // ...and 40 is not 4.
+    assert_eq!(parse_da1_sixel_reply(b"\x1b[?63;40c"), Some(false));
+    // Unrelated bytes and CSI ? sequences before the reply are skipped.
+    assert_eq!(parse_da1_sixel_reply(b"xx\x1b[?62;4c"), Some(true));
+    assert_eq!(parse_da1_sixel_reply(b"\x1b[?1049h\x1b[?63;4c"), Some(true));
+}
+
+#[test]
+fn force_sixel_env_overrides_capability() {
+    let _lock = env_lock().lock().unwrap();
+    {
+        let _force_on = EnvVarGuard::set(FORCE_SIXEL_ENV_VAR, "1");
+        assert!(sixel_graphics_capability(true), "=1 wins over kitty");
+        assert!(sixel_graphics_capability(false));
+    }
+    {
+        let _force_off = EnvVarGuard::set(FORCE_SIXEL_ENV_VAR, "0");
+        assert!(!sixel_graphics_capability(false), "=0 forces off");
+    }
+    {
+        let _unset = EnvVarsRemovedGuard::new(&[FORCE_SIXEL_ENV_VAR]);
+        // Kitty-enabled clients never probe: the native replay path
+        // takes precedence.
+        assert!(!sixel_graphics_capability(true));
+    }
+}
+
+#[test]
+fn force_iip_env_overrides_capability() {
+    let _lock = env_lock().lock().unwrap();
+    {
+        let _force_on = EnvVarGuard::set(FORCE_IIP_ENV_VAR, "1");
+        assert!(iip_graphics_capability(), "=1 forces on");
+    }
+    {
+        let _force_off = EnvVarGuard::set(FORCE_IIP_ENV_VAR, "0");
+        assert!(!iip_graphics_capability(), "=0 forces off");
+    }
+    {
+        let _unset = EnvVarsRemovedGuard::new(&[FORCE_IIP_ENV_VAR]);
+        // No probe: without the override the capability is off.
+        assert!(!iip_graphics_capability());
+    }
+}
+
+#[test]
+fn viewer_env_opts_into_geometry_passive() {
+    let _lock = env_lock().lock().unwrap();
+    {
+        let _viewer = EnvVarGuard::set(VIEWER_ENV_VAR, "1");
+        assert!(geometry_passive_capability(), "=1 opts in");
+    }
+    {
+        let _off = EnvVarGuard::set(VIEWER_ENV_VAR, "0");
+        assert!(!geometry_passive_capability(), "=0 stays normal");
+    }
+    {
+        let _unset = EnvVarsRemovedGuard::new(&[VIEWER_ENV_VAR]);
+        // No probe: without the opt-in the client is a normal client.
+        assert!(!geometry_passive_capability());
+    }
+}
+
+#[test]
+fn sixel_splice_bytes_are_written_inside_synchronized_blit() {
+    let mut output = Vec::new();
+    frame_output::write_encoded_frame_with_passthrough(
+        &mut output,
+        b"\x1b[?2026htext\x1b[?2026lcursor",
+        b"",
+        b"\x1b7\x1b[2;3Hsixel\x1b8",
+    )
+    .unwrap();
+
+    assert_eq!(
+        output,
+        b"\x1b[?2026htext\x1b7\x1b[2;3Hsixel\x1b8\x1b[?2026lcursor"
+    );
+}
+
+#[test]
+fn sixel_splice_positions_at_pane_rect_plus_pane_local_cell() {
+    let rect = crate::protocol::SixelPaneRect {
+        x: 10,
+        y: 5,
+        width: 40,
+        height: 10,
+    };
+    let mut out = Vec::new();
+    frame_output::append_sixel_splice(&mut out, Some(rect), 2, 3, b"<data>", (80, 24));
+
+    // CUP is 1-based: row = 5 + 2 + 1, col = 10 + 3 + 1.
+    assert_eq!(out, b"\x1b7\x1b[8;14H<data>\x1b8");
+}
+
+#[test]
+fn sixel_splice_for_invisible_pane_emits_nothing() {
+    let mut out = Vec::new();
+    frame_output::append_sixel_splice(&mut out, None, 2, 3, b"<data>", (80, 24));
+    assert!(out.is_empty());
+}
+
+#[test]
+fn sixel_splice_outside_pane_rect_or_frame_emits_nothing() {
+    let rect = crate::protocol::SixelPaneRect {
+        x: 10,
+        y: 5,
+        width: 4,
+        height: 3,
+    };
+    let mut out = Vec::new();
+    // Pane-local cell beyond the rect's width/height.
+    frame_output::append_sixel_splice(&mut out, Some(rect), 3, 0, b"<data>", (80, 24));
+    frame_output::append_sixel_splice(&mut out, Some(rect), 0, 4, b"<data>", (80, 24));
+    // Rect origin pushes the absolute cell past the frame edge.
+    let clipped = crate::protocol::SixelPaneRect {
+        x: 79,
+        y: 23,
+        width: 4,
+        height: 3,
+    };
+    frame_output::append_sixel_splice(&mut out, Some(clipped), 1, 1, b"<data>", (80, 24));
+    assert!(out.is_empty());
+}

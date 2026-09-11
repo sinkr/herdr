@@ -20,6 +20,59 @@ fn restore_mode_bar(
 }
 
 impl ClientShellState {
+    pub(crate) fn take_passthrough_bytes(
+        &self,
+        pending: &mut Vec<(
+            ClientEndpointId,
+            crate::protocol::endpoint::EndpointPassthrough,
+        )>,
+        frame_size: (u16, u16),
+    ) -> Vec<u8> {
+        let Some(surface) = self.pane_surface.as_ref() else {
+            return Vec::new();
+        };
+        let area = self.layout(frame_size.0, frame_size.1).pane_surface;
+        let mut bytes = Vec::new();
+        pending.retain(|(endpoint_id, emission)| {
+            if endpoint_id != &self.active_endpoint_id {
+                return true;
+            }
+            if emission.boot_id != surface.boot_id {
+                return false;
+            }
+            if emission.projection_revision > surface.projection_revision
+                || emission.surface_revision > surface.surface_revision
+            {
+                return true;
+            }
+            if emission.projection_revision != surface.projection_revision
+                || emission.surface_revision != surface.surface_revision
+            {
+                return false;
+            }
+            for splice in emission.sixels.iter().chain(&emission.iip) {
+                let mut rect = splice.rect;
+                rect.width = rect.width.min(area.width.saturating_sub(rect.x));
+                rect.height = rect.height.min(area.height.saturating_sub(rect.y));
+                rect.x = rect.x.saturating_add(area.x);
+                rect.y = rect.y.saturating_add(area.y);
+                crate::client::frame_output::append_sixel_splice(
+                    &mut bytes,
+                    Some(rect),
+                    splice.row,
+                    splice.col,
+                    &splice.data,
+                    frame_size,
+                );
+            }
+            for record in &emission.raw_osc {
+                bytes.extend_from_slice(&record.data);
+            }
+            false
+        });
+        bytes
+    }
+
     fn compose_unavailable(&mut self, cols: u16, rows: u16) -> FrameData {
         let layout = self.layout(cols, rows);
         let mut buffer = Buffer::empty(Rect::new(0, 0, cols, rows));
