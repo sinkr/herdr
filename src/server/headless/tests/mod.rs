@@ -5016,7 +5016,8 @@ async fn shutdown_preserves_bound_agent_resume_but_normal_exit_clears_it() {
             let session = crate::agent_resume::PersistedAgentSession {
                 source: "herdr:omp".into(),
                 agent: "omp".into(),
-                session_ref: crate::agent_resume::AgentSessionRef::id("sql-backed-session").unwrap(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("sql-backed-session")
+                    .unwrap(),
             };
             let resume_argv = vec!["omp".into(), "--resume=sql-backed-session".into()];
             let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
@@ -5094,7 +5095,10 @@ async fn shutdown_preserves_bound_agent_resume_but_normal_exit_clears_it() {
                 restored.pending_agent_resume_plan.as_ref().unwrap().argv,
                 resume_argv
             );
-            assert!(runtimes.is_empty(), "resume remains scheduled until startup");
+            assert!(
+                runtimes.is_empty(),
+                "resume remains scheduled until startup"
+            );
 
             // The same exit while running normally must retire the binding, not
             // leave a stale conversation to resurrect at the next restart.

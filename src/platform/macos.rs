@@ -451,10 +451,10 @@ pub(crate) fn pane_shell_pid(child_pid: u32) -> u32 {
             bytes as libc::c_int,
         )
     };
-    if returned <= 0 || returned as usize >= bytes {
+    if returned <= 0 || returned as usize >= pids.len() {
         return child_pid;
     }
-    let count = returned as usize / std::mem::size_of::<libc::pid_t>();
+    let count = returned as usize;
     pty_proxy_shell_pid(
         child_pid,
         &info,
@@ -1545,7 +1545,10 @@ printf '%s\n' "$@" > "$HERDR_NOTIFY_ARGS"
             pty_proxy_shell_pid(
                 100,
                 &proxy,
-                [proxy_child(200, 100, 11, 200), proxy_child(300, 100, 12, 300)],
+                [
+                    proxy_child(200, 100, 11, 200),
+                    proxy_child(300, 100, 12, 300)
+                ],
             ),
             100
         );
