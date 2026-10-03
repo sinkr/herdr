@@ -458,11 +458,9 @@ impl HeadlessServer {
                 continue;
             }
 
-            // Check if we should start shutting down.
+            // Freeze the session at a quit signal, before shutdown-induced agent
+            // exits can clear the bindings needed to resume it.
             if self.app.state.should_quit || self.should_quit.load(Ordering::Acquire) {
-                self.drain_internal_events_with_forwarding_up_to(
-                    crate::app::APP_EVENT_CHANNEL_CAPACITY,
-                );
                 self.initiate_shutdown();
                 continue;
             }

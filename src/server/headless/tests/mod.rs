@@ -5003,6 +5003,113 @@ fn windows_shutdown_probe_preserves_panes_and_agent_sessions() {
 }
 
 #[tokio::test]
+async fn shutdown_preserves_bound_agent_resume_but_normal_exit_clears_it() {
+    for host_shutdown in [false, true] {
+        for reported_resume in [false, true] {
+            let mut server = test_headless_server();
+            let workspace = crate::workspace::Workspace::test_new("bound-agent-shutdown");
+            let pane_id = workspace.tabs[0].root_pane;
+            let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+            server.app.state.workspaces = vec![workspace];
+            server.app.state.ensure_test_terminals();
+            server.app.state.active = Some(0);
+            let session = crate::agent_resume::PersistedAgentSession {
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("sql-backed-session").unwrap(),
+            };
+            let resume_argv = vec!["omp".into(), "--resume=sql-backed-session".into()];
+            let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_detected_state(
+                Some(crate::detect::Agent::Omp),
+                crate::detect::AgentState::Idle,
+            );
+            terminal.set_persisted_agent_session(session.clone());
+            if reported_resume {
+                terminal.restore_reported_resume(crate::agent_resume::ReportedAgentResume {
+                    source: "herdr:omp".into(),
+                    agent: "omp".into(),
+                    argv: resume_argv.clone(),
+                });
+            }
+            let exit_event = || AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::Omp),
+                state: crate::detect::AgentState::Idle,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: true,
+                observed_at: Instant::now(),
+            };
+            server.app.event_tx.try_send(exit_event()).unwrap();
+            let quit_flag = if host_shutdown {
+                server.host_shutdown_requested.clone()
+            } else {
+                server.should_quit.clone()
+            };
+            quit_flag.store(true, Ordering::Release);
+            assert_eq!(
+                server.drain_internal_events_with_forwarding_up_to(16),
+                (false, false)
+            );
+            assert!(!server.handle_internal_event_with_forwarding(exit_event()));
+            assert!(!server.app.event_rx.is_empty());
+
+            let capture = |server: &HeadlessServer| {
+                crate::persist::capture(
+                    &server.app.state.workspaces,
+                    &server.app.state.terminals,
+                    &server.app.terminal_runtimes,
+                    server.app.state.active,
+                    server.app.state.selected,
+                )
+            };
+            let snapshot = capture(&server);
+            let pane = &snapshot.workspaces[0].tabs[0].panes[&pane_id.raw()];
+            assert_eq!(
+                pane.agent_session.as_ref().unwrap().value,
+                session.session_ref.value
+            );
+            assert_eq!(pane.agent_resume.is_some(), reported_resume);
+            let snapshot = serde_json::from_slice(
+                &serde_json::to_vec(&snapshot).expect("serialize shutdown snapshot"),
+            )
+            .expect("deserialize shutdown snapshot");
+            let (_, terminals, runtimes) = crate::persist::restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                0,
+                &server.app.state.default_shell,
+                crate::config::ShellModeConfig::NonLogin,
+                true,
+                server.app.event_tx.clone(),
+                server.app.render_notify.clone(),
+                server.app.render_dirty.clone(),
+            );
+            let restored = terminals.values().next().expect("restored bound terminal");
+            assert_eq!(restored.persisted_agent_session.as_ref(), Some(&session));
+            assert_eq!(
+                restored.pending_agent_resume_plan.as_ref().unwrap().argv,
+                resume_argv
+            );
+            assert!(runtimes.is_empty(), "resume remains scheduled until startup");
+
+            // The same exit while running normally must retire the binding, not
+            // leave a stale conversation to resurrect at the next restart.
+            quit_flag.store(false, Ordering::Release);
+            server.drain_internal_events_with_forwarding_up_to(16);
+            let snapshot = capture(&server);
+            let pane = &snapshot.workspaces[0].tabs[0].panes[&pane_id.raw()];
+            assert!(pane.agent_session.is_none());
+            assert!(pane.agent_resume.is_none());
+            shutdown_test_runtimes(&mut server);
+        }
+    }
+}
+
+#[tokio::test]
 async fn pane_death_reconciles_each_client_view_and_focus() {
     let mut server = test_headless_server();
     let mut workspace = crate::workspace::Workspace::test_new("pane-death-views");
