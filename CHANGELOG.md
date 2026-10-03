@@ -5,6 +5,7 @@
 ### Fixed
 - Quit signals preserve bound agent sessions before shutdown-induced process exits can clear their saved resume commands.
 - On macOS, agent detection follows the inner shell behind Atuin's PTY proxy, preserving live session bindings while still retiring agents that return to the shell prompt.
+- OMP reports an explicit resume command that preserves its active profile even when the workspace name differs.
 
 ## [0.9.3] - 2026-09-29
 
