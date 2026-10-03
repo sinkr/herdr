@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=10
+// HERDR_INTEGRATION_VERSION=11
 // @ts-nocheck
 
 import net from "node:net";
@@ -113,13 +113,18 @@ function updateSessionRef(ctx: any): void {
 }
 
 function withSessionRef(params: Record<string, unknown>): Record<string, unknown> {
-  if (currentAgentSessionPath) {
-    return { ...params, agent_session_path: currentAgentSessionPath };
+  const session = currentAgentSessionPath || currentAgentSessionId;
+  if (!session) {
+    return params;
   }
-  if (currentAgentSessionId) {
-    return { ...params, agent_session_id: currentAgentSessionId };
-  }
-  return params;
+  return {
+    ...params,
+    ...(currentAgentSessionPath
+      ? { agent_session_path: currentAgentSessionPath }
+      : { agent_session_id: currentAgentSessionId }),
+    // Restore the active profile rather than deriving it from a renamed workspace.
+    resume_argv: ["omp", "--profile", process.env.OMP_PROFILE || "default", "--resume", session],
+  };
 }
 
 function parseDurationEnv(name: string, fallback: number): number {
@@ -135,13 +140,10 @@ function parseDurationEnv(name: string, fallback: number): number {
 }
 
 function currentSessionRef(): Record<string, unknown> | undefined {
-  if (currentAgentSessionPath) {
-    return { agent_session_path: currentAgentSessionPath };
+  if (!currentAgentSessionPath && !currentAgentSessionId) {
+    return undefined;
   }
-  if (currentAgentSessionId) {
-    return { agent_session_id: currentAgentSessionId };
-  }
-  return undefined;
+  return withSessionRef({});
 }
 
 function reportSession(sessionStartSource = "startup"): Promise<void> {
