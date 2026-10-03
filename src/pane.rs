@@ -783,6 +783,16 @@ fn probe_foreground_process_from_jobs(
 }
 
 fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessProbeResult {
+    #[cfg(target_os = "macos")]
+    let (pid, foreground_pgid) = {
+        let shell_pid = crate::platform::pane_shell_pid(pid);
+        let foreground_pgid = if shell_pid == pid {
+            foreground_pgid
+        } else {
+            crate::detect::foreground_process_group_id(shell_pid)
+        };
+        (shell_pid, foreground_pgid)
+    };
     probe_foreground_process_from_jobs(
         pid,
         foreground_pgid,
@@ -5227,6 +5237,56 @@ mod tests {
             argv: None,
             cmdline: None,
         }
+    }
+
+    #[test]
+    fn inner_pty_shell_probe_keeps_live_omp_and_retires_it_at_the_prompt() {
+        let shell_pid = 200;
+        let agent_job = crate::platform::ForegroundJob {
+            process_group_id: 300,
+            processes: vec![foreground_process(300, "omp")],
+        };
+        let running = probe_foreground_process_from_jobs(
+            shell_pid,
+            Some(300),
+            Some(agent_job),
+            || None,
+            |_| None,
+        );
+        assert_eq!(running.agent, Some(Agent::Omp));
+        assert!(!running.foreground_is_pane_shell);
+        assert_eq!(
+            foreground_shell_agent_action(
+                Some(Agent::Omp),
+                running.agent,
+                running.foreground_is_pane_shell,
+                false,
+            ),
+            ForegroundShellAgentAction::ObserveProbe
+        );
+
+        let shell_job = crate::platform::ForegroundJob {
+            process_group_id: shell_pid,
+            processes: vec![foreground_process(shell_pid, "zsh")],
+        };
+        let idle = probe_foreground_process_from_jobs(
+            shell_pid,
+            Some(shell_pid),
+            None,
+            || Some(shell_job),
+            |_| None,
+        );
+        assert!(idle.agent.is_none());
+        assert!(idle.foreground_is_pane_shell);
+        assert_eq!(
+            foreground_shell_agent_action(
+                Some(Agent::Omp),
+                idle.agent,
+                idle.foreground_is_pane_shell,
+                false,
+            ),
+            ForegroundShellAgentAction::ReportProcessExit
+        );
     }
 
     #[test]

@@ -414,7 +414,79 @@ fn target_nofile_soft_limit(
 }
 
 pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
-    super::available_pane_shell_from_job(child_pid, foreground_job(child_pid)?)
+    let shell_pid = pane_shell_pid(child_pid);
+    super::available_pane_shell_from_job(shell_pid, foreground_job(shell_pid)?)
+}
+
+/// Atuin's PTY proxy owns the outer terminal, but its direct child owns the
+/// interactive shell's terminal. Follow that terminal, not the idle proxy.
+pub(crate) fn pane_shell_pid(child_pid: u32) -> u32 {
+    let Some(info) = process_bsdinfo(child_pid) else {
+        return child_pid;
+    };
+    if !info
+        .pbi_comm
+        .iter()
+        .map(|byte| *byte as u8)
+        .take(6)
+        .eq(b"atuin\0".iter().copied())
+    {
+        return child_pid;
+    }
+    let Some(argv) = process_argv(child_pid) else {
+        return child_pid;
+    };
+    if argv.get(1).map(String::as_str) != Some("pty-proxy") {
+        return child_pid;
+    }
+
+    // A proxy has one terminal-owning child. Bound the lookup and reject an
+    // ambiguous/truncated result rather than scanning unrelated descendants.
+    let mut pids = [0 as libc::pid_t; 16];
+    let bytes = std::mem::size_of_val(&pids);
+    let returned = unsafe {
+        libc::proc_listchildpids(
+            child_pid as libc::pid_t,
+            pids.as_mut_ptr().cast(),
+            bytes as libc::c_int,
+        )
+    };
+    if returned <= 0 || returned as usize >= bytes {
+        return child_pid;
+    }
+    let count = returned as usize / std::mem::size_of::<libc::pid_t>();
+    pty_proxy_shell_pid(
+        child_pid,
+        &info,
+        pids[..count]
+            .iter()
+            .filter(|pid| **pid > 0)
+            .filter_map(|pid| process_bsdinfo(*pid as u32)),
+    )
+}
+
+fn pty_proxy_shell_pid(
+    proxy_pid: u32,
+    proxy: &libc::proc_bsdinfo,
+    children: impl IntoIterator<Item = libc::proc_bsdinfo>,
+) -> u32 {
+    let mut shell_pid = None;
+    for child in children {
+        if child.pbi_ppid != proxy_pid
+            || child.pbi_uid != proxy.pbi_uid
+            || child.e_tdev == proxy.e_tdev
+            || child.e_tdev == u32::MAX
+            || child.e_tpgid == 0
+            || child.e_tpgid == u32::MAX
+            || child.pbi_pgid != child.pbi_pid
+        {
+            continue;
+        }
+        if shell_pid.replace(child.pbi_pid).is_some() {
+            return proxy_pid;
+        }
+    }
+    shell_pid.unwrap_or(proxy_pid)
 }
 
 /// Collect the foreground terminal job for a given child PID.
@@ -509,6 +581,7 @@ fn process_group_pids(process_group_id: u32) -> Vec<u32> {
 /// Read `e_tpgid` (foreground process group of the controlling terminal)
 /// for the given PID.
 pub fn foreground_process_group_id(pid: u32) -> Option<u32> {
+    let pid = pane_shell_pid(pid);
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
 
@@ -1355,6 +1428,82 @@ printf '%s\n' "$@" > "$HERDR_NOTIFY_ARGS"
         assert_eq!(
             args,
             "-e\non run argv\n-e\ndisplay notification (item 2 of argv) with title (item 1 of argv)\n-e\nend run\ntitle\nbody\n"
+        );
+    }
+
+    fn proxy_child(pid: u32, parent: u32, tty: u32, foreground: u32) -> libc::proc_bsdinfo {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        info.pbi_pid = pid;
+        info.pbi_ppid = parent;
+        info.pbi_pgid = pid;
+        info.e_tdev = tty;
+        info.e_tpgid = foreground;
+        info
+    }
+
+    #[test]
+    fn atuin_pty_proxy_follows_only_its_inner_terminal_owner() {
+        let proxy = proxy_child(100, 1, 10, 100);
+        let inner_shell = proxy_child(200, 100, 11, 300);
+        let unrelated = proxy_child(400, 999, 12, 400);
+        let shell_pid = pty_proxy_shell_pid(100, &proxy, [unrelated, inner_shell]);
+        assert_eq!(shell_pid, 200);
+
+        let agent_job = ForegroundJob {
+            process_group_id: 300,
+            processes: vec![ForegroundProcess {
+                pid: 300,
+                name: "bun".into(),
+                argv0: Some("bun".into()),
+                argv: Some(vec![
+                    "bun".into(),
+                    "/Users/test/.bun/bin/omp".into(),
+                    "--resume=sql-session".into(),
+                ]),
+                cmdline: None,
+            }],
+        };
+        assert_eq!(
+            crate::detect::identify_agent_in_job(&agent_job).map(|(agent, _)| agent),
+            Some(crate::detect::Agent::Omp)
+        );
+        assert!(super::super::available_pane_shell_from_job(shell_pid, agent_job).is_none());
+
+        let idle_job = ForegroundJob {
+            process_group_id: shell_pid,
+            processes: vec![ForegroundProcess {
+                pid: shell_pid,
+                name: "zsh".into(),
+                argv0: Some("zsh".into()),
+                argv: None,
+                cmdline: None,
+            }],
+        };
+        assert_eq!(
+            super::super::available_pane_shell_from_job(shell_pid, idle_job),
+            Some("zsh".into())
+        );
+    }
+
+    #[test]
+    fn atuin_pty_proxy_rejects_missing_or_ambiguous_inner_terminals() {
+        let proxy = proxy_child(100, 1, 10, 100);
+        assert_eq!(pty_proxy_shell_pid(100, &proxy, []), 100);
+        assert_eq!(
+            pty_proxy_shell_pid(100, &proxy, [proxy_child(200, 100, 10, 200)]),
+            100
+        );
+        assert_eq!(
+            pty_proxy_shell_pid(100, &proxy, [proxy_child(200, 100, u32::MAX, u32::MAX)]),
+            100
+        );
+        assert_eq!(
+            pty_proxy_shell_pid(
+                100,
+                &proxy,
+                [proxy_child(200, 100, 11, 200), proxy_child(300, 100, 12, 300)],
+            ),
+            100
         );
     }
 

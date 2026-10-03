@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+- Quit signals preserve bound agent sessions before shutdown-induced process exits can clear their saved resume commands.
+- On macOS, agent detection follows the inner shell behind Atuin's PTY proxy, preserving live session bindings while still retiring agents that return to the shell prompt.
+
 ## [0.9.3] - 2026-09-29
 
 This is a hotfix release for v0.9.2. See the v0.9.2 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.2
