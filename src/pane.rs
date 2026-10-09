@@ -5971,6 +5971,7 @@ mod tests {
                 running.agent,
                 running.foreground_is_pane_shell,
                 false,
+                AgentJobStatus::Unknown,
             ),
             ForegroundShellAgentAction::ObserveProbe
         );
@@ -5994,6 +5995,7 @@ mod tests {
                 idle.agent,
                 idle.foreground_is_pane_shell,
                 false,
+                AgentJobStatus::Unknown,
             ),
             ForegroundShellAgentAction::ReportProcessExit
         );
