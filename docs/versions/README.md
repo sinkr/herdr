@@ -2,16 +2,15 @@
 
 This directory contains the published documentation for stable Herdr releases.
 
-Release CI creates each version from the tagged `docs/next` tree after the GitHub Release succeeds. Maintainers can correct published documentation in its version directory afterward. When a correction also applies to future releases, make the same focused change under `docs/next`; do not replace a published tree with the current draft.
+Release CI creates each version from the tagged `docs/next` tree after the GitHub Release succeeds. Maintainers can make corrections and improvements in a published version directory afterward, without another Herdr release. Keep those edits accurate for that version; do not add unreleased behavior. When a change also applies to future releases, make the same focused change under `docs/next`; do not replace a published tree with the current draft. Pushing changes under `docs/versions/` to `master` automatically triggers the private website deployment.
 
-Validate the manifest and build every published version with:
+Validate every published version with:
 
 ```bash
-node website/scripts/docs-versions.mjs check
-cd website && bun run build
+node scripts/docs/versions.mjs check
 ```
 
-`website/scripts/prepare-docs.mjs` renders each maintained version at `/docs/<version>/` and uses the version selected by `manifest.json` for `/docs/`. Generated files under `website/src/content/docs/` are not editable sources. `/docs/preview/` comes only from the active preview release snapshot in `docs/preview/`, never directly from `docs/next/`.
+The private website renders each maintained version at `/docs/<version>/`, uses the version selected by `manifest.json` for `/docs/`, and renders the active preview snapshot at `/docs/preview/`. The source snapshots in this directory remain public release evidence; the private repository owns only their presentation.
 
 The `tag`, `commit`, and `source` fields in `manifest.json` record where release CI initially published a version. Git history records later documentation corrections.
 

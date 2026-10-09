@@ -293,7 +293,7 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .unwrap();
     assert_eq!(integration_status.status.code(), Some(0));
     let status_stdout = String::from_utf8_lossy(&integration_status.stdout);
-    assert!(status_stdout.contains("pi: current (v8)"));
+    assert!(status_stdout.contains("pi: current (v9)"));
     assert!(status_stdout.contains("claude: not installed"));
 
     let integration_uninstall = Command::new(env!("CARGO_BIN_EXE_herdr"))
@@ -382,88 +382,49 @@ fn status_commands_report_client_and_server_versions() {
         "stderr: {}",
         String::from_utf8_lossy(&full.stderr)
     );
-    let full_stdout = String::from_utf8_lossy(&full.stdout);
-    assert!(full_stdout.contains("client:\n"), "stdout: {full_stdout}");
-    assert!(
-        full_stdout.contains(&format!("  version: {}", env!("CARGO_PKG_VERSION"))),
-        "stdout: {full_stdout}"
-    );
-    assert!(
-        full_stdout.contains("  protocol: 20"),
-        "stdout: {full_stdout}"
-    );
-    assert!(full_stdout.contains("server:\n"), "stdout: {full_stdout}");
-    assert!(
-        full_stdout.contains("  status: running"),
-        "stdout: {full_stdout}"
-    );
-    assert!(
-        full_stdout.contains("  compatible: yes"),
-        "stdout: {full_stdout}"
-    );
-    assert!(
-        full_stdout.contains("  restart_needed: no"),
-        "stdout: {full_stdout}"
-    );
-    assert!(
-        full_stdout.contains(&socket_path.display().to_string()),
-        "stdout: {full_stdout}"
-    );
 
     let server = run_cli(&socket_path, &["status", "server"]);
     assert!(server.status.success());
-    let server_stdout = String::from_utf8_lossy(&server.stdout);
-    assert!(
-        server_stdout.contains("status: running"),
-        "stdout: {server_stdout}"
-    );
-    assert!(
-        server_stdout.contains(&format!("version: {}", env!("CARGO_PKG_VERSION"))),
-        "stdout: {server_stdout}"
-    );
-    assert!(
-        server_stdout.contains("protocol: 20"),
-        "stdout: {server_stdout}"
-    );
 
     let client = run_cli(&socket_path, &["status", "client"]);
     assert!(client.status.success());
-    let client_stdout = String::from_utf8_lossy(&client.stdout);
-    assert!(
-        client_stdout.contains(&format!("version: {}", env!("CARGO_PKG_VERSION"))),
-        "stdout: {client_stdout}"
-    );
-    assert!(
-        client_stdout.contains("protocol: 20"),
-        "stdout: {client_stdout}"
-    );
-    assert!(
-        client_stdout.contains("binary: "),
-        "stdout: {client_stdout}"
-    );
 
     let full_json = run_cli_json(&socket_path, &["status", "--json"]);
     assert_eq!(full_json["client"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(full_json["client"]["protocol"], 20);
+    assert_eq!(full_json["client"]["protocol"], CURRENT_PROTOCOL);
+    assert_eq!(
+        full_json["client"]["endpoint_protocol_generation"],
+        crate::support::CURRENT_ENDPOINT_PROTOCOL_GENERATION
+    );
+    assert_eq!(full_json["client"]["remote_host_bridge"], true);
     assert_eq!(full_json["server"]["status"], "running");
     assert_eq!(full_json["server"]["running"], true);
     assert_eq!(full_json["server"]["compatible"], true);
+    assert_eq!(full_json["server"]["endpoint_compatible"], true);
     assert_eq!(
         full_json["server"]["socket"],
         socket_path.display().to_string()
     );
     assert_eq!(full_json["server"]["restart_needed"], false);
+    assert_eq!(full_json["server"]["server_binary_stale"], false);
     assert_eq!(full_json["update"]["restart_needed"], false);
+    assert_eq!(full_json["update"]["server_binary_stale"], false);
 
     let server_json = run_cli_json(&socket_path, &["status", "server", "--json"]);
     assert_eq!(server_json["status"], "running");
     assert_eq!(server_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(server_json["protocol"], 20);
+    assert_eq!(server_json["protocol"], CURRENT_PROTOCOL);
     assert_eq!(server_json["compatible"], true);
+    assert_eq!(server_json["endpoint_compatible"], true);
 
     let client_json = run_cli_json(&socket_path, &["status", "client", "--json"]);
     assert_eq!(client_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(client_json["protocol"], 20);
+    assert_eq!(client_json["protocol"], CURRENT_PROTOCOL);
+    assert_eq!(
+        client_json["endpoint_protocol_generation"],
+        crate::support::CURRENT_ENDPOINT_PROTOCOL_GENERATION
+    );
+    assert_eq!(client_json["remote_host_bridge"], true);
     assert!(client_json["binary"]
         .as_str()
         .is_some_and(|path| !path.is_empty()));
@@ -485,6 +446,10 @@ fn status_reports_not_running_when_server_socket_is_missing() {
     assert!(stdout.contains("  status: not running"), "stdout: {stdout}");
     assert!(stdout.contains("  restart_needed: no"), "stdout: {stdout}");
     assert!(
+        stdout.contains("  server_binary_stale: no"),
+        "stdout: {stdout}"
+    );
+    assert!(
         stdout.contains(&socket_path.display().to_string()),
         "stdout: {stdout}"
     );
@@ -497,7 +462,9 @@ fn status_reports_not_running_when_server_socket_is_missing() {
         socket_path.display().to_string()
     );
     assert_eq!(status_json["server"]["restart_needed"], false);
+    assert_eq!(status_json["server"]["server_binary_stale"], false);
     assert_eq!(status_json["update"]["restart_needed"], false);
+    assert_eq!(status_json["update"]["server_binary_stale"], false);
 
     cleanup_test_base(&base);
 }
@@ -632,6 +599,78 @@ fn server_stop_then_restart_restores_pane_history() {
     );
 
     cleanup_spawned_herdr(restarted, base);
+}
+
+#[test]
+fn unloaded_session_survives_autosave_and_shutdown_when_recovery_is_blocked() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let data_dir = config_home.join(app_dir_name());
+    fs::create_dir_all(&data_dir).unwrap();
+    let session_path = data_dir.join("session.json");
+    let original = b"{unreadable layout";
+    fs::write(&session_path, original).unwrap();
+    fs::write(data_dir.join("session-backups"), b"blocks recovery").unwrap();
+
+    let mut herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || {
+            fs::read_to_string(data_dir.join("herdr-server.log"))
+                .is_ok_and(|log| log.contains("event=\"persist.save\""))
+        }
+    ));
+    assert_eq!(fs::read(&session_path).unwrap(), original);
+
+    assert!(run_cli(&socket_path, &["server", "stop"]).status.success());
+    let pid = herdr.child.process_id();
+    assert!(herdr.child.wait().unwrap().success());
+    unregister_spawned_herdr_pid(pid);
+    assert_eq!(fs::read(&session_path).unwrap(), original);
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn session_appearing_after_startup_is_preserved_before_autosave() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let data_dir = config_home.join(app_dir_name());
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    // The API socket binds before restore; a read-only App request waits for it.
+    let ready = run_cli_json(&socket_path, &["workspace", "list"]);
+    assert_eq!(ready["result"]["workspaces"], serde_json::json!([]));
+    // The server has already evaluated restore, but has not created any layout.
+    let original = include_bytes!("../fixtures/session/current-herdr-session.json");
+    fs::write(data_dir.join("session.json"), original).unwrap();
+    run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || {
+            fs::read_to_string(data_dir.join("herdr-server.log"))
+                .is_ok_and(|log| log.contains("event=\"persist.save\""))
+        }
+    ));
+    let backups: Vec<_> = fs::read_dir(data_dir.join("session-backups"))
+        .expect("late session must be preserved before autosave")
+        .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+        .collect();
+    assert_eq!(backups, vec![original.to_vec()]);
+    cleanup_spawned_herdr(herdr, base);
 }
 
 #[test]

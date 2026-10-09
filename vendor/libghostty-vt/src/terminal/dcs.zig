@@ -18,6 +18,12 @@ pub const Handler = struct {
     /// This is arbitrarily set to 1MB today, increase if needed.
     max_bytes: usize = 1024 * 1024,
 
+    /// Maximum bytes a Sixel passthrough sequence can accumulate. Sixel
+    /// image payloads are much larger than other DCS commands, so they
+    /// get a dedicated, larger cap. Sequences that exceed the cap are
+    /// dropped entirely (never forwarded truncated).
+    max_bytes_sixel: usize = 8 * 1024 * 1024,
+
     pub fn deinit(self: *Handler) void {
         self.discard();
     }
@@ -72,6 +78,28 @@ pub const Handler = struct {
                         },
                         .command = .{ .tmux = .enter },
                     };
+                },
+
+                // Sixel graphics (DCS Ps;Ps;Ps q). The payload is not
+                // decoded; the full sequence is re-synthesized and buffered
+                // so hosts can pass it through to attached clients.
+                'q' => sixel: {
+                    var buffer: std.Io.Writer.Allocating = try .initCapacity(
+                        alloc,
+                        256, // Arbitrary choice to limit initial reallocs
+                    );
+                    errdefer buffer.deinit();
+
+                    // Re-synthesize the introducer so unhook can surface
+                    // the complete sequence bytes.
+                    try buffer.writer.writeAll("\x1bP");
+                    for (dcs.params, 0..) |param, i| {
+                        if (i > 0) try buffer.writer.writeByte(';');
+                        try buffer.writer.print("{d}", .{param});
+                    }
+                    try buffer.writer.writeByte('q');
+
+                    break :sixel .{ .state = .{ .sixel = buffer } };
                 },
 
                 else => null,
@@ -141,6 +169,14 @@ pub const Handler = struct {
                 try list.writer.writeByte(byte);
             },
 
+            .sixel => |*list| {
+                if (list.written().len >= self.max_bytes_sixel) {
+                    return error.OutOfMemory;
+                }
+
+                try list.writer.writeByte(byte);
+            },
+
             .decrqss => |*buffer| {
                 if (buffer.len >= buffer.data.len) {
                     return error.OutOfMemory;
@@ -178,6 +214,20 @@ pub const Handler = struct {
                 break :xtgettcap .{ .xtgettcap = .{ .data = list.* } };
             },
 
+            .sixel => |*list| sixel: {
+                // Note: purposely do not deinit our state here because
+                // we transfer ownership into the resulting command.
+                list.writer.writeAll("\x1b\\") catch {
+                    // Terminating the sequence failed (allocation); drop
+                    // the whole emission rather than forward a truncated
+                    // sequence.
+                    var owned = list.*;
+                    owned.deinit();
+                    break :sixel null;
+                };
+                break :sixel .{ .sixel = .{ .data = list.* } };
+            },
+
             .decrqss => |buffer| .{ .decrqss = switch (buffer.len) {
                 0 => .none,
                 1 => switch (buffer.data[0]) {
@@ -211,6 +261,9 @@ pub const Command = union(enum) {
     /// DECRQSS
     decrqss: DECRQSS,
 
+    /// Sixel graphics passthrough
+    sixel: Sixel,
+
     /// Tmux control mode
     tmux: if (build_options.tmux_control_mode)
         terminal.tmux.ControlNotification
@@ -221,6 +274,7 @@ pub const Command = union(enum) {
         switch (self.*) {
             .xtgettcap => |*v| v.data.deinit(),
             .decrqss => {},
+            .sixel => |*v| v.data.deinit(),
             .tmux => {},
         }
     }
@@ -247,6 +301,18 @@ pub const Command = union(enum) {
         }
     };
 
+    /// Sixel graphics passthrough. The data is the complete re-synthesized
+    /// DCS sequence (`ESC P <params> q <payload> ESC \`), suitable for
+    /// writing verbatim to a sixel-capable terminal. The payload is NOT
+    /// decoded or validated beyond DCS framing.
+    pub const Sixel = struct {
+        data: std.Io.Writer.Allocating,
+
+        pub fn bytes(self: *Sixel) []const u8 {
+            return self.data.written();
+        }
+    };
+
     /// Supported DECRQSS settings
     pub const DECRQSS = enum {
         none,
@@ -254,6 +320,63 @@ pub const Command = union(enum) {
         decscusr,
         decstbm,
         decslrm,
+
+        /// Fixed upper bound for an encoded DECRPSS response. The comptime
+        /// calculated max at the time of writing this was around 63 so this
+        /// leaves a ton of space for future stuff. We don't do the comptime
+        /// calculation cause it complicated the implementation a bit too
+        /// much.
+        pub const max_response_bytes = 256;
+
+        /// Encode the response for this request.
+        pub fn encode(
+            self: DECRQSS,
+            t: *terminal.Terminal,
+            response: []u8,
+        ) ![]const u8 {
+            var writer: std.Io.Writer = .fixed(response);
+
+            const prefix_fmt = "\x1bP{d}$r";
+            const prefix_len = std.fmt.comptimePrint(prefix_fmt, .{0}).len;
+            writer.end = prefix_len;
+
+            switch (self) {
+                .none => {},
+                .sgr => {
+                    const buf = try t.printAttributes(writer.buffer[writer.end..]);
+                    writer.end += buf.len;
+                    try writer.writeByte('m');
+                },
+                .decscusr => {
+                    const blink = t.modes.get(.cursor_blinking);
+                    const style: u8 = switch (t.screens.active.cursor.cursor_style) {
+                        .block, .block_hollow => if (blink) 1 else 2,
+                        .underline => if (blink) 3 else 4,
+                        .bar => if (blink) 5 else 6,
+                    };
+                    try writer.print("{d} q", .{style});
+                },
+                .decstbm => try writer.print("{d};{d}r", .{
+                    t.scrolling_region.top + 1,
+                    t.scrolling_region.bottom + 1,
+                }),
+                .decslrm => if (t.modes.get(.enable_left_and_right_margin)) {
+                    try writer.print("{d};{d}s", .{
+                        t.scrolling_region.left + 1,
+                        t.scrolling_region.right + 1,
+                    });
+                },
+            }
+
+            const valid = writer.end > prefix_len;
+            try writer.writeAll("\x1b\\");
+            _ = try std.fmt.bufPrint(
+                response[0..prefix_len],
+                prefix_fmt,
+                .{@intFromBool(valid)},
+            );
+            return writer.buffered();
+        }
     };
 };
 
@@ -267,6 +390,10 @@ const State = union(enum) {
 
     /// XTGETTCAP
     xtgettcap: std.Io.Writer.Allocating,
+
+    /// Sixel graphics passthrough. Accumulates the full re-synthesized
+    /// sequence bytes.
+    sixel: std.Io.Writer.Allocating,
 
     /// DECRQSS
     decrqss: struct {
@@ -287,6 +414,7 @@ const State = union(enum) {
             => {},
 
             .xtgettcap => |*v| v.deinit(),
+            .sixel => |*v| v.deinit(),
             .decrqss => {},
             .tmux => |*v| if (comptime build_options.tmux_control_mode) {
                 v.deinit();
@@ -405,6 +533,90 @@ test "DECRQSS invalid command" {
     try testing.expect(h.unhook() == null);
 }
 
+test "DECRQSS response encoding" {
+    const testing = std.testing;
+
+    var t: terminal.Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        fn expectResponse(
+            term: *terminal.Terminal,
+            request: Command.DECRQSS,
+            expected: []const u8,
+        ) !void {
+            var buf: [Command.DECRQSS.max_response_bytes]u8 = undefined;
+            const encoded = try request.encode(term, &buf);
+            try testing.expectEqualStrings(expected, encoded);
+        }
+    };
+
+    try S.expectResponse(&t, .none, "\x1BP0$r\x1B\\");
+    try S.expectResponse(&t, .sgr, "\x1BP1$r0m\x1B\\");
+
+    try t.setAttribute(.bold);
+    try t.setAttribute(.{ .underline = .curly });
+    try S.expectResponse(&t, .sgr, "\x1BP1$r0;1;4:3m\x1B\\");
+
+    t.setCursorStyle(.steady_underline);
+    try S.expectResponse(&t, .decscusr, "\x1BP1$r4 q\x1B\\");
+
+    t.scrolling_region.top = 4;
+    t.scrolling_region.bottom = 19;
+    try S.expectResponse(&t, .decstbm, "\x1BP1$r5;20r\x1B\\");
+
+    try S.expectResponse(&t, .decslrm, "\x1BP0$r\x1B\\");
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.scrolling_region.left = 2;
+    t.scrolling_region.right = 69;
+    try S.expectResponse(&t, .decslrm, "\x1BP1$r3;70s\x1B\\");
+}
+
+test "DECRQSS largest response fits fixed buffer" {
+    const testing = std.testing;
+
+    var t: terminal.Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    try t.setAttribute(.bold);
+    try t.setAttribute(.faint);
+    try t.setAttribute(.italic);
+    try t.setAttribute(.{ .underline = .dashed });
+    try t.setAttribute(.blink);
+    try t.setAttribute(.inverse);
+    try t.setAttribute(.invisible);
+    try t.setAttribute(.strikethrough);
+    try t.setAttribute(.overline);
+    try t.setAttribute(.{ .direct_color_fg = .{
+        .r = 255,
+        .g = 255,
+        .b = 255,
+    } });
+    try t.setAttribute(.{ .direct_color_bg = .{
+        .r = 255,
+        .g = 255,
+        .b = 255,
+    } });
+
+    var buf: [Command.DECRQSS.max_response_bytes]u8 = undefined;
+    const encoded = try Command.DECRQSS.sgr.encode(&t, &buf);
+
+    const expected =
+        "\x1BP1$r0;1;2;3;4:5;53;5;7;8;9" ++
+        ";38:2::255:255:255" ++
+        ";48:2::255:255:255m\x1B\\";
+    try testing.expectEqualStrings(expected, encoded);
+    try testing.expect(encoded.len <= Command.DECRQSS.max_response_bytes);
+}
+
 test "tmux enter and implicit exit" {
     if (comptime !build_options.tmux_control_mode) return error.SkipZigTest;
 
@@ -427,4 +639,48 @@ test "tmux enter and implicit exit" {
         try testing.expect(cmd == .tmux);
         try testing.expect(cmd.tmux == .exit);
     }
+}
+
+test "sixel passthrough reconstructs full sequence" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var h: Handler = .{};
+    defer h.deinit();
+    try testing.expect(h.hook(alloc, .{ .params = &.{ 0, 0, 8 }, .final = 'q' }) == null);
+    for ("\"1;1;4;4#0;2;0;0;0#0!4~") |byte| _ = h.put(byte);
+    var cmd = h.unhook().?;
+    defer cmd.deinit();
+    try testing.expect(cmd == .sixel);
+    try testing.expectEqualStrings(
+        "\x1bP0;0;8q\"1;1;4;4#0;2;0;0;0#0!4~\x1b\\",
+        cmd.sixel.bytes(),
+    );
+}
+
+test "sixel passthrough without params" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var h: Handler = .{};
+    defer h.deinit();
+    try testing.expect(h.hook(alloc, .{ .final = 'q' }) == null);
+    for ("#0~") |byte| _ = h.put(byte);
+    var cmd = h.unhook().?;
+    defer cmd.deinit();
+    try testing.expect(cmd == .sixel);
+    try testing.expectEqualStrings("\x1bPq#0~\x1b\\", cmd.sixel.bytes());
+}
+
+test "sixel passthrough over cap is dropped entirely" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var h: Handler = .{ .max_bytes_sixel = 16 };
+    defer h.deinit();
+    try testing.expect(h.hook(alloc, .{ .params = &.{ 0, 0, 8 }, .final = 'q' }) == null);
+    for ("#0;2;0;0;0#0!200~-!200~") |byte| _ = h.put(byte);
+    try testing.expect(h.state == .ignore);
+    try testing.expect(h.unhook() == null);
+    try testing.expect(h.state == .inactive);
 }

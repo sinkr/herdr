@@ -47,7 +47,11 @@ impl Default for UpdateConfig {
 }
 
 fn default_update_channel() -> UpdateChannelConfig {
-    if cfg!(windows) {
+    default_update_channel_for_build(cfg!(windows), crate::build_info::is_preview())
+}
+
+fn default_update_channel_for_build(is_windows: bool, is_preview: bool) -> UpdateChannelConfig {
+    if is_windows && is_preview {
         UpdateChannelConfig::Preview
     } else {
         UpdateChannelConfig::Stable
@@ -95,15 +99,6 @@ pub enum AgentPanelSortConfig {
     #[serde(alias = "workspaces")]
     Spaces,
     Priority,
-}
-
-impl AgentPanelSortConfig {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Spaces => "spaces",
-            Self::Priority => "priority",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -263,6 +258,8 @@ pub struct TerminalConfig {
     pub shell_mode: ShellModeConfig,
     /// CWD policy for new interactive panes, tabs, and workspaces.
     pub new_cwd: NewTerminalCwdConfig,
+    /// Render Kitty graphics in compatible outer terminals. Default: true.
+    pub kitty_graphics: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -271,12 +268,15 @@ pub struct SessionConfig {
     /// Resume supported AI-agent panes into their native conversation sessions
     /// when restoring a Herdr session. Default: true.
     pub resume_agents_on_restore: bool,
+    /// Milliseconds between automatic agent restores. Zero disables spacing.
+    pub startup_per_agent_delay_ms: u32,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             resume_agents_on_restore: true,
+            startup_per_agent_delay_ms: 100,
         }
     }
 }
@@ -315,6 +315,7 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
     pub session: SessionConfig,
+    pub server: ServerConfig,
     pub update: UpdateConfig,
     pub keys: KeysConfig,
     pub ui: UiConfig,
@@ -333,8 +334,9 @@ pub struct LoadedConfig {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct KeysConfig {
-    /// Prefix key to enter prefix mode (e.g. "ctrl+b", "f12", "esc").
-    pub prefix: String,
+    /// Prefix key(s) to enter prefix mode (e.g. "ctrl+b", "f12", "esc", or an
+    /// array to accept several).
+    pub prefix: BindingConfig,
     /// Open keybinding help. Default: "prefix+?"
     pub help: BindingConfig,
     /// Open settings. Default: "prefix+s"
@@ -367,7 +369,7 @@ pub struct KeysConfig {
     pub navigate_pane_up: BindingConfig,
     /// Focus the pane to the right in navigate mode. Default: "l". Right arrow is always an alias.
     pub navigate_pane_right: BindingConfig,
-    /// Detach from server/client mode, or exit --no-session mode. Default: "prefix+q".
+    /// Detach the current client from its Herdr server. Default: "prefix+q".
     pub detach: BindingConfig,
     /// Reload config.toml in the running app/server. Default: "prefix+shift+r".
     pub reload_config: BindingConfig,
@@ -407,6 +409,7 @@ pub struct KeysConfig {
     pub rename_pane: BindingConfig,
     /// Open the focused pane scrollback in $EDITOR. Default: "prefix+e".
     pub edit_scrollback: BindingConfig,
+    pub clear_pane: BindingConfig,
     /// Enter keyboard copy mode for the focused pane. Default: "prefix+[".
     pub copy_mode: BindingConfig,
     /// Focus the pane to the left. Default: "prefix+h".
@@ -465,7 +468,12 @@ pub struct KeysConfig {
 #[serde(default)]
 pub(crate) struct KeysConfigOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
-    prefix: Option<String>,
+    prefix: Option<BindingConfig>,
+    /// Additional prefix keys published for cross-version compatibility.
+    /// Older clients parse `prefix` as a single string and ignore this field;
+    /// new clients merge it into the effective prefix list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_prefixes: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     help: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -538,6 +546,7 @@ pub(crate) struct KeysConfigOverlay {
     rename_pane: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     edit_scrollback: Option<BindingConfig>,
+    clear_pane: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     copy_mode: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -588,6 +597,17 @@ pub(crate) struct KeysConfigOverlay {
     command: Option<Vec<CommandKeybindConfig>>,
 }
 
+impl KeysConfigOverlay {
+    pub(crate) fn set_prefixes(&mut self, prefixes: &[super::keybinds::KeyCombo]) {
+        let mut labels = prefixes
+            .iter()
+            .map(|combo| super::keybinds::format_key_combo(*combo));
+        self.prefix = Some(BindingConfig::One(labels.next().unwrap_or_default()));
+        let extra: Vec<String> = labels.collect();
+        self.extra_prefixes = (!extra.is_empty()).then_some(BindingConfig::Many(extra));
+    }
+}
+
 impl<'de> Deserialize<'de> for KeysConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -595,6 +615,25 @@ impl<'de> Deserialize<'de> for KeysConfig {
     {
         let input = KeysConfigOverlay::deserialize(deserializer)?;
         let mut keys = KeysConfig::default();
+
+        let prefix_was_supplied = input.prefix.is_some() || input.extra_prefixes.is_some();
+        let mut prefix_values = Vec::new();
+        if let Some(prefix) = input.prefix {
+            prefix_values.extend(prefix.into_values());
+        }
+        if let Some(extra) = input.extra_prefixes {
+            prefix_values.extend(extra.into_values());
+        }
+        if prefix_was_supplied {
+            // An explicitly empty list stays empty so prefix validation rejects
+            // it and a reload keeps the current keybindings.
+            keys.prefix = match prefix_values.len() {
+                0 => BindingConfig::Many(Vec::new()),
+                1 => BindingConfig::One(prefix_values.remove(0)),
+                _ => BindingConfig::Many(prefix_values),
+            };
+            keys.user_fields.insert("prefix");
+        }
 
         macro_rules! apply_field {
             ($field:ident) => {
@@ -605,7 +644,6 @@ impl<'de> Deserialize<'de> for KeysConfig {
             };
         }
 
-        apply_field!(prefix);
         apply_field!(help);
         apply_field!(settings);
         apply_field!(new_workspace);
@@ -642,6 +680,7 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(close_tab);
         apply_field!(rename_pane);
         apply_field!(edit_scrollback);
+        apply_field!(clear_pane);
         apply_field!(copy_mode);
         apply_field!(focus_pane_left);
         apply_field!(focus_pane_down);
@@ -746,6 +785,7 @@ impl KeysConfig {
         copy_effective_action_field!(close_tab, keybinds.close_tab);
         copy_effective_action_field!(rename_pane, keybinds.rename_pane);
         copy_effective_action_field!(edit_scrollback, keybinds.edit_scrollback);
+        copy_effective_action_field!(clear_pane, keybinds.clear_pane);
         copy_effective_action_field!(copy_mode, keybinds.copy_mode);
         copy_effective_action_field!(focus_pane_left, keybinds.focus_pane_left);
         copy_effective_action_field!(focus_pane_down, keybinds.focus_pane_down);
@@ -840,6 +880,60 @@ pub enum TabBarPositionConfig {
     Bottom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneBordersConfig {
+    #[default]
+    Auto,
+    Always,
+    Off,
+}
+
+impl PaneBordersConfig {
+    pub fn draws_borders(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn shows_borders(self, multi_pane: bool) -> bool {
+        self.draws_borders() && (multi_pane || matches!(self, Self::Always))
+    }
+}
+
+impl<'de> Deserialize<'de> for PaneBordersConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PaneBordersVisitor;
+
+        impl<'de> de::Visitor<'de> for PaneBordersVisitor {
+            type Value = PaneBordersConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("\"auto\", \"always\", \"off\", or a legacy boolean")
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(if value {
+                    PaneBordersConfig::Auto
+                } else {
+                    PaneBordersConfig::Off
+                })
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "auto" => Ok(PaneBordersConfig::Auto),
+                    "always" => Ok(PaneBordersConfig::Always),
+                    "off" => Ok(PaneBordersConfig::Off),
+                    other => Err(E::invalid_value(de::Unexpected::Str(other), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(PaneBordersVisitor)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -872,8 +966,12 @@ pub struct UiConfig {
     pub prompt_new_tab_name: bool,
     /// Ask for a workspace name before interactive creation. Default: false.
     pub prompt_new_workspace_name: bool,
-    /// Draw borders around split panes. Default: true.
-    pub pane_borders: bool,
+    /// Draw borders around split panes. auto draws them only for split panes,
+    /// always also frames a lone pane (only while pane_outer_borders is
+    /// enabled, since every edge of a lone pane is an outer edge), off
+    /// disables them. Legacy booleans map true to auto and false to off.
+    /// Default: auto.
+    pub pane_borders: PaneBordersConfig,
     /// Draw borders along the outside edge of the pane area. Default: true.
     pub pane_outer_borders: bool,
     /// Draw interactive scrollbars beside terminal panes. Default: true.
@@ -940,6 +1038,18 @@ impl ImeCursorShape {
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
+pub struct ServerConfig {
+    /// Windows: allow ordinary same-account clients to control an elevated server. Default: false.
+    #[cfg(windows)]
+    pub allow_unelevated_clients: bool,
+    /// Virtual terminal width used when no client is attached. Default: 120.
+    pub headless_cols: u16,
+    /// Virtual terminal height used when no client is attached. Default: 40.
+    pub headless_rows: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct AdvancedConfig {
     /// Maximum scrollback buffer size in bytes retained per pane terminal. Default: 10000000.
     #[serde(alias = "scrollback_lines")]
@@ -967,8 +1077,8 @@ impl Default for RemoteConfig {
 pub struct ExperimentalConfig {
     /// Allow launching herdr inside an existing herdr pane. Default: false.
     pub allow_nested: bool,
-    /// Experimental local Kitty graphics rendering for attached clients. Default: false.
-    pub kitty_graphics: bool,
+    /// Deprecated compatibility key for `terminal.kitty_graphics`.
+    pub kitty_graphics: Option<bool>,
     /// Persist pane screen history to session-history.json. Default: false.
     pub pane_history: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
@@ -989,7 +1099,7 @@ pub struct ExperimentalConfig {
     /// if the list contains no valid names, the reveal does not apply.
     /// Accepted names: pi, claude, codex, gemini, cursor, devin, cline,
     /// opencode, copilot, kimi, kiro, droid, amp, grok, hermes, kilo,
-    /// qodercli, qoder, maki.
+    /// qodercli, qoder, qwen, qwen-code, letta, letta-code, maki.
     /// Default: empty.
     pub cjk_ime_agents: Vec<String>,
     /// Cursor shape rendered for the IME anchor when
@@ -1010,7 +1120,7 @@ pub struct ExperimentalConfig {
 impl Default for KeysConfig {
     fn default() -> Self {
         Self {
-            prefix: "ctrl+b".into(),
+            prefix: BindingConfig::one("ctrl+b"),
             help: BindingConfig::one("prefix+?"),
             settings: BindingConfig::one("prefix+s"),
             new_workspace: BindingConfig::one("prefix+shift+n"),
@@ -1047,6 +1157,7 @@ impl Default for KeysConfig {
             close_tab: BindingConfig::one("prefix+shift+x"),
             rename_pane: BindingConfig::one("prefix+shift+p"),
             edit_scrollback: BindingConfig::one("prefix+e"),
+            clear_pane: BindingConfig::default(),
             copy_mode: BindingConfig::one("prefix+["),
             focus_pane_left: BindingConfig::one("prefix+h"),
             focus_pane_down: BindingConfig::one("prefix+j"),
@@ -1102,7 +1213,7 @@ impl Default for UiConfig {
             confirm_close: true,
             prompt_new_tab_name: true,
             prompt_new_workspace_name: false,
-            pane_borders: true,
+            pane_borders: PaneBordersConfig::Auto,
             pane_outer_borders: true,
             pane_scrollbars: true,
             pane_gaps: true,
@@ -1200,6 +1311,17 @@ impl<'de> Deserialize<'de> for ToastConfig {
     }
 }
 
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            #[cfg(windows)]
+            allow_unelevated_clients: false,
+            headless_cols: crate::config::DEFAULT_HEADLESS_COLS,
+            headless_rows: crate::config::DEFAULT_HEADLESS_ROWS,
+        }
+    }
+}
+
 impl Default for AdvancedConfig {
     fn default() -> Self {
         Self {
@@ -1232,21 +1354,33 @@ manifest_check = false
         assert!(!config.update.manifest_check);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_update_config_defaults_to_preview() {
+    fn update_channel_default_follows_windows_build_identity() {
+        assert_eq!(
+            default_update_channel_for_build(true, true),
+            UpdateChannelConfig::Preview
+        );
+        assert_eq!(
+            default_update_channel_for_build(true, false),
+            UpdateChannelConfig::Stable
+        );
+        assert_eq!(
+            default_update_channel_for_build(false, true),
+            UpdateChannelConfig::Stable
+        );
+    }
+
+    #[test]
+    fn missing_update_channel_uses_build_default() {
         let empty: Config = toml::from_str("").unwrap();
         let without_update_channel: Config =
             toml::from_str("[update]\nversion_check = false").unwrap();
 
-        assert_eq!(
-            Config::default().update.channel,
-            UpdateChannelConfig::Preview
-        );
-        assert_eq!(empty.update.channel, UpdateChannelConfig::Preview);
+        assert_eq!(Config::default().update.channel, default_update_channel());
+        assert_eq!(empty.update.channel, default_update_channel());
         assert_eq!(
             without_update_channel.update.channel,
-            UpdateChannelConfig::Preview
+            default_update_channel()
         );
     }
 
@@ -1300,13 +1434,16 @@ new_cwd = "~/Projects"
     fn resume_agents_on_restore_defaults_on_and_parses() {
         let default_config = Config::default();
         assert!(default_config.session.resume_agents_on_restore);
+        assert_eq!(default_config.session.startup_per_agent_delay_ms, 100);
 
         let toml = r#"
 [session]
 resume_agents_on_restore = false
+startup_per_agent_delay_ms = 0
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
+        assert_eq!(config.session.startup_per_agent_delay_ms, 0);
     }
 
     #[test]
@@ -1356,9 +1493,34 @@ status_indicators = "symbols"
     }
 
     #[test]
+    fn pane_borders_legacy_booleans_map_to_modes() {
+        let enabled: Config = toml::from_str("[ui]\npane_borders = true").unwrap();
+        assert_eq!(enabled.ui.pane_borders, PaneBordersConfig::Auto);
+
+        let disabled: Config = toml::from_str("[ui]\npane_borders = false").unwrap();
+        assert_eq!(disabled.ui.pane_borders, PaneBordersConfig::Off);
+
+        let auto: Config = toml::from_str("[ui]\npane_borders = \"auto\"").unwrap();
+        assert_eq!(auto.ui.pane_borders, PaneBordersConfig::Auto);
+
+        let off: Config = toml::from_str("[ui]\npane_borders = \"off\"").unwrap();
+        assert_eq!(off.ui.pane_borders, PaneBordersConfig::Off);
+
+        let unknown = toml::from_str::<Config>("[ui]\npane_borders = \"framed\"")
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("\"auto\", \"always\", \"off\", or a legacy boolean"));
+
+        let wrong_type = toml::from_str::<Config>("[ui]\npane_borders = 3")
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type.contains("\"auto\", \"always\", \"off\", or a legacy boolean"));
+    }
+
+    #[test]
     fn pane_appearance_defaults_and_parse() {
         let default_config = Config::default();
-        assert!(default_config.ui.pane_borders);
+        assert_eq!(default_config.ui.pane_borders, PaneBordersConfig::Auto);
         assert!(default_config.ui.pane_outer_borders);
         assert!(default_config.ui.pane_scrollbars);
         assert!(default_config.ui.pane_gaps);
@@ -1373,7 +1535,7 @@ status_indicators = "symbols"
 
         let toml = r#"
 [ui]
-pane_borders = false
+pane_borders = "always"
 pane_outer_borders = false
 pane_scrollbars = false
 pane_gaps = true
@@ -1390,7 +1552,7 @@ tab_bar_right = [
 tab_bar_right_separator = " · "
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert!(!config.ui.pane_borders);
+        assert_eq!(config.ui.pane_borders, PaneBordersConfig::Always);
         assert!(!config.ui.pane_outer_borders);
         assert!(!config.ui.pane_scrollbars);
         assert!(config.ui.pane_gaps);
@@ -1818,6 +1980,45 @@ delay_seconds = {}
     }
 
     #[test]
+    fn server_headless_size_defaults_and_parses() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.server.headless_cols,
+            crate::config::DEFAULT_HEADLESS_COLS
+        );
+        assert_eq!(
+            default_config.server.headless_rows,
+            crate::config::DEFAULT_HEADLESS_ROWS
+        );
+
+        let config: Config = toml::from_str(
+            r#"[server]
+headless_cols = 160
+headless_rows = 50
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.server.headless_cols, 160);
+        assert_eq!(config.server.headless_rows, 50);
+
+        let invalid: Config = toml::from_str(
+            r#"[server]
+headless_cols = 0
+headless_rows = 50
+"#,
+        )
+        .unwrap();
+        assert!(invalid.invalid_headless_size_diagnostic().is_some());
+        assert_eq!(
+            invalid.headless_size(),
+            (
+                crate::config::DEFAULT_HEADLESS_COLS,
+                crate::config::DEFAULT_HEADLESS_ROWS
+            )
+        );
+    }
+
+    #[test]
     fn advanced_defaults_include_scrollback_limit_bytes() {
         let config = Config::default();
         assert_eq!(
@@ -1840,16 +2041,41 @@ pane_history = true
     }
 
     #[test]
-    fn kitty_graphics_default_off_and_parse() {
-        let config = Config::default();
-        assert!(!config.experimental.kitty_graphics);
+    fn kitty_graphics_default_on_with_stable_opt_out() {
+        assert!(Config::default().kitty_graphics_enabled());
 
-        let toml = r#"
+        let config: Config = toml::from_str(
+            r#"
+[terminal]
+kitty_graphics = false
+"#,
+        )
+        .unwrap();
+        assert!(!config.kitty_graphics_enabled());
+    }
+
+    #[test]
+    fn legacy_experimental_kitty_graphics_setting_remains_compatible() {
+        let disabled: Config = toml::from_str(
+            r#"
+[experimental]
+kitty_graphics = false
+"#,
+        )
+        .unwrap();
+        assert!(!disabled.kitty_graphics_enabled());
+
+        let stable_setting_wins: Config = toml::from_str(
+            r#"
+[terminal]
+kitty_graphics = false
+
 [experimental]
 kitty_graphics = true
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert!(config.experimental.kitty_graphics);
+"#,
+        )
+        .unwrap();
+        assert!(!stable_setting_wins.kitty_graphics_enabled());
     }
 
     #[test]
@@ -1863,7 +2089,8 @@ switch_ascii_input_source_in_prefix = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.experimental.allow_nested);
-        assert!(config.experimental.kitty_graphics);
+        assert_eq!(config.experimental.kitty_graphics, Some(true));
+        assert!(config.kitty_graphics_enabled());
         assert!(config.experimental.pane_history);
         assert!(config.experimental.switch_ascii_input_source_in_prefix);
     }

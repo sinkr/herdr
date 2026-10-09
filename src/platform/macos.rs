@@ -7,6 +7,8 @@ use std::process::{Command, Stdio};
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
+pub(super) const REMOTE_BRIDGE_CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+
 use super::{
     read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
     LimitedRead, Signal,
@@ -16,14 +18,166 @@ pub(crate) use super::unix_common::{
     configure_status_command, create_remote_private_dir, create_remote_ssh_config_dir,
     create_remote_ssh_config_file, hostname, local_datetime, remote_bridge_endpoint_path,
     remote_private_temp_base, remote_reattach_argument, remote_reattach_program,
-    remote_ssh_config_paths, status_commands_supported, StatusCommandGuard,
+    remote_ssh_config_paths, set_default_plugin_pane_pwd, shutdown_client_stream,
+    status_commands_supported, wait_client_stream_readable, write_client_stream,
+    ClientStreamReader, StatusCommandGuard,
 };
+
+mod bootstrap;
+pub(crate) use bootstrap::{configure_server_daemon_context, prepare_server_process};
+
+#[cfg(test)]
+mod config_file_tests;
+
+pub(crate) fn config_file_link_count(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(path)?.nlink())
+}
+
+pub(crate) fn check_config_write_target(_target: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+pub(crate) fn write_existing_config(
+    _target: &std::path::Path,
+    _contents: &[u8],
+) -> std::io::Result<bool> {
+    // Unix keeps atomic replacement for existing files too.
+    Ok(false)
+}
+
+pub(crate) fn create_config_temporary(
+    path: &Path,
+    private: bool,
+) -> std::io::Result<std::fs::File> {
+    if !private {
+        return std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path);
+    }
+    use std::os::fd::FromRawFd;
+    // Darwin's opaque ACL/filesec APIs (<sys/acl.h>, <sys/fcntl.h>) are not
+    // exposed by libc. Supply a non-inheriting empty ACL at creation: clearing
+    // inherited ACEs later cannot revoke descriptors opened in the meantime.
+    unsafe extern "C" {
+        fn acl_init(count: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+        fn acl_get_flagset_np(acl: *mut libc::c_void, flags: *mut *mut libc::c_void)
+            -> libc::c_int;
+        fn acl_add_flag_np(flags: *mut libc::c_void, flag: libc::c_uint) -> libc::c_int;
+        fn filesec_init() -> *mut libc::c_void;
+        fn filesec_free(security: *mut libc::c_void);
+        fn filesec_set_property(
+            security: *mut libc::c_void,
+            property: libc::c_int,
+            value: *const libc::c_void,
+        ) -> libc::c_int;
+        fn openx_np(
+            path: *const libc::c_char,
+            flags: libc::c_int,
+            security: *mut libc::c_void,
+        ) -> libc::c_int;
+    }
+    const FILESEC_MODE: libc::c_int = 4;
+    const FILESEC_ACL: libc::c_int = 5;
+    const ACL_FLAG_NO_INHERIT: libc::c_uint = 1 << 17;
+    let path =
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    let acl = unsafe { acl_init(0) };
+    if acl.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let security = unsafe { filesec_init() };
+    if security.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            acl_free(acl);
+        }
+        return Err(error);
+    }
+    let result = (|| {
+        let mut flags = std::ptr::null_mut();
+        let mode: libc::mode_t = 0o600;
+        if unsafe { acl_get_flagset_np(acl, &mut flags) } != 0
+            || unsafe { acl_add_flag_np(flags, ACL_FLAG_NO_INHERIT) } != 0
+            || unsafe {
+                filesec_set_property(security, FILESEC_MODE, std::ptr::from_ref(&mode).cast())
+            } != 0
+            || unsafe {
+                filesec_set_property(security, FILESEC_ACL, std::ptr::from_ref(&acl).cast())
+            } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = unsafe {
+            openx_np(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                security,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // The successful exclusive create returns one owned descriptor.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    })();
+    unsafe {
+        filesec_free(security);
+        acl_free(acl);
+    }
+    result
+}
+
+pub(crate) fn write_config_temporary(
+    source: Option<&Path>,
+    temporary: &Path,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(temporary)?;
+    if let Some(source) = source {
+        let input = std::fs::File::open(source)?;
+        let metadata = input.metadata()?;
+        let current = output.metadata()?;
+        if (metadata.uid(), metadata.gid()) != (current.uid(), current.gid())
+            && unsafe { libc::fchown(output.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Prepare access controls while the temporary is still empty. Copy ACLs
+        // before mode bits so no inherited/default grant can expose the content.
+        // Do not copy data or old timestamps.
+        if unsafe {
+            libc::fcopyfile(
+                input.as_raw_fd(),
+                output.as_raw_fd(),
+                std::ptr::null_mut(),
+                libc::COPYFILE_ACL | libc::COPYFILE_XATTR,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        output.set_permissions(metadata.permissions())?;
+    }
+    output.write_all(contents)?;
+    output.sync_all()
+}
 
 const PROC_PGRP_ONLY: u32 = 2;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     false
+}
+
+pub(crate) fn should_query_host_terminal_palette() -> bool {
+    true
 }
 
 fn raw_command_argv(command: &str, flag: &str) -> Vec<std::ffi::OsString> {
@@ -260,7 +414,79 @@ fn target_nofile_soft_limit(
 }
 
 pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
-    super::available_pane_shell_from_job(child_pid, foreground_job(child_pid)?)
+    let shell_pid = pane_shell_pid(child_pid);
+    super::available_pane_shell_from_job(shell_pid, foreground_job(shell_pid)?)
+}
+
+/// Atuin's PTY proxy owns the outer terminal, but its direct child owns the
+/// interactive shell's terminal. Follow that terminal, not the idle proxy.
+pub(crate) fn pane_shell_pid(child_pid: u32) -> u32 {
+    let Some(info) = process_bsdinfo(child_pid) else {
+        return child_pid;
+    };
+    if !info
+        .pbi_comm
+        .iter()
+        .map(|byte| *byte as u8)
+        .take(6)
+        .eq(b"atuin\0".iter().copied())
+    {
+        return child_pid;
+    }
+    let Some(argv) = process_argv(child_pid) else {
+        return child_pid;
+    };
+    if argv.get(1).map(String::as_str) != Some("pty-proxy") {
+        return child_pid;
+    }
+
+    // A proxy has one terminal-owning child. Bound the lookup and reject an
+    // ambiguous/truncated result rather than scanning unrelated descendants.
+    let mut pids = [0 as libc::pid_t; 16];
+    let bytes = std::mem::size_of_val(&pids);
+    let returned = unsafe {
+        libc::proc_listchildpids(
+            child_pid as libc::pid_t,
+            pids.as_mut_ptr().cast(),
+            bytes as libc::c_int,
+        )
+    };
+    if returned <= 0 || returned as usize >= pids.len() {
+        return child_pid;
+    }
+    let count = returned as usize;
+    pty_proxy_shell_pid(
+        child_pid,
+        &info,
+        pids[..count]
+            .iter()
+            .filter(|pid| **pid > 0)
+            .filter_map(|pid| process_bsdinfo(*pid as u32)),
+    )
+}
+
+fn pty_proxy_shell_pid(
+    proxy_pid: u32,
+    proxy: &libc::proc_bsdinfo,
+    children: impl IntoIterator<Item = libc::proc_bsdinfo>,
+) -> u32 {
+    let mut shell_pid = None;
+    for child in children {
+        if child.pbi_ppid != proxy_pid
+            || child.pbi_uid != proxy.pbi_uid
+            || child.e_tdev == proxy.e_tdev
+            || child.e_tdev == u32::MAX
+            || child.e_tpgid == 0
+            || child.e_tpgid == u32::MAX
+            || child.pbi_pgid != child.pbi_pid
+        {
+            continue;
+        }
+        if shell_pid.replace(child.pbi_pid).is_some() {
+            return proxy_pid;
+        }
+    }
+    shell_pid.unwrap_or(proxy_pid)
 }
 
 /// Collect the foreground terminal job for a given child PID.
@@ -355,6 +581,7 @@ fn process_group_pids(process_group_id: u32) -> Vec<u32> {
 /// Read `e_tpgid` (foreground process group of the controlling terminal)
 /// for the given PID.
 pub fn foreground_process_group_id(pid: u32) -> Option<u32> {
+    let pid = pane_shell_pid(pid);
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
 
@@ -518,14 +745,18 @@ pub fn read_clipboard_text() -> Option<String> {
     }
 }
 
-pub fn open_url(url: &str) -> std::io::Result<()> {
+pub fn clipboard_text_matches(_bytes: &[u8]) -> Option<bool> {
+    None
+}
+
+pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     Command::new("open")
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
-    Ok(())
+        .spawn()
+        .map(Some)
 }
 
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
@@ -752,6 +983,50 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
     drop(stdin);
 
     child.wait().map(|status| status.success()).unwrap_or(false)
+}
+
+/// Start time of `pid` in microseconds. It tells a process apart from a later
+/// one that reuses its pid.
+pub fn process_start_token(pid: u32) -> Option<u64> {
+    process_bsdinfo(pid).map(|info| bsdinfo_start_token(&info))
+}
+
+/// Process group of `pid` while that same process, matched by its start
+/// token, is alive on the terminal of the pane shell `shell_pid`. A stopped or
+/// backgrounded job still counts.
+pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
+    let process = process_bsdinfo(pid)?;
+    let shell = process_bsdinfo(shell_pid)?;
+    (process.pbi_status != libc::SZOMB
+        && bsdinfo_start_token(&process) == start_token
+        && process.e_tdev == shell.e_tdev)
+        .then_some(process.pbi_pgid)
+}
+
+fn bsdinfo_start_token(info: &libc::proc_bsdinfo) -> u64 {
+    info.pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec)
+}
+
+pub(super) fn socket_peer_pid(fd: RawFd) -> Option<u32> {
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        )
+    };
+    (result == 0 && pid > 0).then_some(pid as u32)
+}
+
+pub(super) fn process_name_and_parent(pid: u32) -> Option<(String, u32)> {
+    let info = process_bsdinfo(pid)?;
+    Some((comm_from_bsdinfo(&info)?, info.pbi_ppid))
 }
 
 fn process_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
@@ -1197,6 +1472,85 @@ printf '%s\n' "$@" > "$HERDR_NOTIFY_ARGS"
         assert_eq!(
             args,
             "-e\non run argv\n-e\ndisplay notification (item 2 of argv) with title (item 1 of argv)\n-e\nend run\ntitle\nbody\n"
+        );
+    }
+
+    fn proxy_child(pid: u32, parent: u32, tty: u32, foreground: u32) -> libc::proc_bsdinfo {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        info.pbi_pid = pid;
+        info.pbi_ppid = parent;
+        info.pbi_pgid = pid;
+        info.e_tdev = tty;
+        info.e_tpgid = foreground;
+        info
+    }
+
+    #[test]
+    fn atuin_pty_proxy_follows_only_its_inner_terminal_owner() {
+        let proxy = proxy_child(100, 1, 10, 100);
+        let inner_shell = proxy_child(200, 100, 11, 300);
+        let unrelated = proxy_child(400, 999, 12, 400);
+        let shell_pid = pty_proxy_shell_pid(100, &proxy, [unrelated, inner_shell]);
+        assert_eq!(shell_pid, 200);
+
+        let agent_job = ForegroundJob {
+            process_group_id: 300,
+            processes: vec![ForegroundProcess {
+                pid: 300,
+                name: "bun".into(),
+                argv0: Some("bun".into()),
+                argv: Some(vec![
+                    "bun".into(),
+                    "/Users/test/.bun/bin/omp".into(),
+                    "--resume=sql-session".into(),
+                ]),
+                cmdline: None,
+            }],
+        };
+        assert_eq!(
+            crate::detect::identify_agent_in_job(&agent_job).map(|(agent, _)| agent),
+            Some(crate::detect::Agent::Omp)
+        );
+        assert!(super::super::available_pane_shell_from_job(shell_pid, agent_job).is_none());
+
+        let idle_job = ForegroundJob {
+            process_group_id: shell_pid,
+            processes: vec![ForegroundProcess {
+                pid: shell_pid,
+                name: "zsh".into(),
+                argv0: Some("zsh".into()),
+                argv: None,
+                cmdline: None,
+            }],
+        };
+        assert_eq!(
+            super::super::available_pane_shell_from_job(shell_pid, idle_job),
+            Some("zsh".into())
+        );
+    }
+
+    #[test]
+    fn atuin_pty_proxy_rejects_missing_or_ambiguous_inner_terminals() {
+        let proxy = proxy_child(100, 1, 10, 100);
+        assert_eq!(pty_proxy_shell_pid(100, &proxy, []), 100);
+        assert_eq!(
+            pty_proxy_shell_pid(100, &proxy, [proxy_child(200, 100, 10, 200)]),
+            100
+        );
+        assert_eq!(
+            pty_proxy_shell_pid(100, &proxy, [proxy_child(200, 100, u32::MAX, u32::MAX)]),
+            100
+        );
+        assert_eq!(
+            pty_proxy_shell_pid(
+                100,
+                &proxy,
+                [
+                    proxy_child(200, 100, 11, 200),
+                    proxy_child(300, 100, 12, 300)
+                ],
+            ),
+            100
         );
     }
 
