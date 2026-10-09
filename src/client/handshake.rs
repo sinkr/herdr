@@ -349,6 +349,7 @@ pub(super) fn initialize_host_graphics(kitty_graphics_enabled: bool) {
 }
 
 /// Primary Device Attributes request for the outer terminal.
+#[cfg(unix)]
 const HOST_DA1_QUERY: &[u8] = b"\x1b[c";
 
 /// How long the pre-handshake DA1 probe waits for the outer terminal's
@@ -408,6 +409,7 @@ pub(super) fn geometry_passive_capability() -> bool {
 /// Returns `Some(true)` when the attribute list contains `4` (Sixel),
 /// `Some(false)` for a complete reply without it, and `None` while no
 /// complete reply has arrived yet.
+#[cfg(any(unix, test))]
 pub(super) fn parse_da1_sixel_reply(buffer: &[u8]) -> Option<bool> {
     let mut index = 0;
     while let Some(start) = buffer[index..]

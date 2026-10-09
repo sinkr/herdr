@@ -514,7 +514,7 @@ impl ClientState {
         let _ = self.try_present_frame(frame_data);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn write_composed_output(
         &mut self,
         writer: &mut impl io::Write,
