@@ -405,11 +405,19 @@ fn create_generation(base: &Path) -> io::Result<Generation> {
         }
         validate_directory(base)?;
         remove_stale_generations(base);
+        // Stores sharing a base (several native stores in one server, or
+        // parallel tests) can create generations within one clock tick, so a
+        // process-wide sequence keeps the name unique; only the pid is parsed.
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = base.join(format!("server-{}-{nonce}", std::process::id()));
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = base.join(format!(
+            "server-{}-{nonce}-{sequence}",
+            std::process::id()
+        ));
         fs::create_dir(&root)?;
         fs::set_permissions(&root, fs::Permissions::from_mode(DIRECTORY_MODE))?;
         let source = root.join("source");
